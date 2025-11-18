@@ -1,4 +1,4 @@
-module github.com/b3nk3/bifrost
+module github.com/LottieHQ/bifrost
 
 go 1.24
 

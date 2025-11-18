@@ -18,9 +18,9 @@ builds:
       - darwin
     ldflags:
       - -s -w
-      - -X github.com/b3nk3/bifrost/cmd.Version={{.Version}}
-      - -X github.com/b3nk3/bifrost/cmd.BuildDate={{.Date}}
-      - -X github.com/b3nk3/bifrost/cmd.Commit={{.Commit}}
+      - -X github.com/LottieHQ/bifrost/cmd.Version={{.Version}}
+      - -X github.com/LottieHQ/bifrost/cmd.BuildDate={{.Date}}
+      - -X github.com/LottieHQ/bifrost/cmd.Commit={{.Commit}}
 
 archives:
   - formats: tar.gz
@@ -56,7 +56,7 @@ homebrew_casks:
 
     directory: Casks
 
-    homepage: "https://github.com/b3nk3/bifrost"
+    homepage: "https://github.com/LottieHQ/bifrost"
     description: "A command-line utility to simplify connecting to AWS RDS/Redis instances through bastion hosts utilising AWS SSM Session Manager."
 
     dependencies:
@@ -65,7 +65,7 @@ homebrew_casks:
       - cask: session-manager-plugin
 
     repository:
-      owner: b3nk3
+      owner: LottieHQ
       name: homebrew-tap
       branch: main
       token: "{{ .Env.GH_DEPLOYMENTS_BOT_PAT }}"

@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/b3nk3/bifrost/internal/config"
-	"github.com/b3nk3/bifrost/internal/sso"
-	"github.com/b3nk3/bifrost/internal/ui"
+	"github.com/LottieHQ/bifrost/internal/config"
+	"github.com/LottieHQ/bifrost/internal/sso"
+	"github.com/LottieHQ/bifrost/internal/ui"
 	"github.com/spf13/cobra"
 )
 

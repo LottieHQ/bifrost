@@ -35,7 +35,7 @@ Bifrost is a Go CLI application that simplifies connecting to AWS RDS/Redis inst
 - **Connection Profiles**: Complete connection configs that reference SSO profiles - can be local or global
 
 #### Configuration Hierarchy
-- **Global Config** (`~/.bifrost/config.yaml`): SSO profiles + global connection profiles  
+- **Global Config** (`~/.bifrost/config.yaml`): SSO profiles + global connection profiles
 - **Local Config** (`.bifrost.config.yaml`): Project-specific connection profiles
 - **Priority**: Local connection profiles override global ones with same name
 
@@ -101,7 +101,7 @@ type ConnectionProfile struct {
 The connect command (`cmd/connect.go`) implements a sophisticated user experience:
 
 1. **Profile Resolution**: Check `--profile` flag → Interactive profile selection → Manual setup
-2. **Visual Profile Selection**: 
+2. **Visual Profile Selection**:
    - `🔗 profile-name` for existing connection profiles
    - `⚙️ Manual setup` for interactive configuration
 3. **Smart Defaults**: Profile values serve as defaults, prompting only for missing values
@@ -180,7 +180,7 @@ type ConnectionProfile struct {
 # Test SSO configuration with auto-region detection
 ./bifrost auth configure --profile test-profile
 
-# Test SSO authentication  
+# Test SSO authentication
 ./bifrost auth login --profile test-profile
 
 # Test connection profiles (defaults to local storage)
@@ -197,7 +197,7 @@ type ConnectionProfile struct {
 
 # Test resource discovery for each service type
 # - Leave bastion field empty → shows SSM-managed instances
-# - Leave RDS field empty → shows all RDS instances  
+# - Leave RDS field empty → shows all RDS instances
 # - Leave Redis field empty → shows all Redis clusters
 
 # Test keep alive functionality (works with all services)
@@ -245,7 +245,7 @@ connection_profiles:
 ## Distribution
 
 - Built with **GoReleaser** (`.goreleaser.yaml`)
-- Distributed via private Homebrew tap (`b3nk3/homebrew-tap`)
+- Distributed via private Homebrew tap (`LottieHQ/homebrew-tap`)
 - Dependencies: `awscli`, `gh`, `session-manager-plugin` (cask)
 - Currently macOS only (Darwin)
 
@@ -260,7 +260,7 @@ The profile saving offer (`offerToSaveProfile()` in `cmd/connect.go`) executes *
 ### Visual UX Patterns
 Consistent emoji usage throughout the application:
 - `🔐` SSO profiles and authentication
-- `🔗` Connection profiles  
+- `🔗` Connection profiles
 - `⚙️` Manual setup option
 - `📁` Local storage, `🌍` Global storage
 - `✅` Success, `❌` Error, `⚠️` Warning, `💡` Tips
@@ -275,7 +275,7 @@ Consistent emoji usage throughout the application:
 
 When adding new AWS services, follow the resource discovery pattern:
 1. Add service type to connection profile enum
-2. Implement tag-based filtering in connect command  
+2. Implement tag-based filtering in connect command
 3. Add interactive selection for multiple resources
 4. Follow existing patterns in `getRDSEndpoint()` and `getRedisEndpoint()`
 
