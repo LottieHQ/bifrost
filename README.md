@@ -18,7 +18,7 @@ A command-line utility to simplify connecting to AWS RDS/Redis instances through
 
 1. Add the Homebrew tap:
    ```bash
-   brew tap b3nk3/tap
+   brew tap LottieHQ/tap
    ```
 
 2. Install Bifrost:
