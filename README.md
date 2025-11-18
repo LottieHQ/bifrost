@@ -16,6 +16,8 @@ A command-line utility to simplify connecting to AWS RDS/Redis instances through
 
 ### Using Homebrew
 
+Firstly, set up a github PAT with repo read access and export it in your shell config as an env variable named `HOMEBREW_GITHUB_API_TOKEN`.
+
 1. Add the Homebrew tap:
    ```bash
    brew tap LottieHQ/tap

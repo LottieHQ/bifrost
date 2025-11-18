@@ -20,3 +20,4 @@ jobs:
           github_token: ${{ secrets.GH_DEPLOYMENTS_BOT_PAT }}
           release_branches: main
           tag_prefix: v
+          default_bump: false
