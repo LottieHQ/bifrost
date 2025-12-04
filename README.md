@@ -16,26 +16,22 @@ A command-line utility to simplify connecting to AWS RDS/Redis instances through
 
 ### Using Homebrew
 
-Firstly, set up a github PAT with repo read access and export it in your shell config as an env variable named `HOMEBREW_GITHUB_API_TOKEN`.
+Bifrost is distributed via a private Homebrew tap. Choose one of the following options:
 
-Then install Bifrost:
+#### Option 1: HTTPS with GitHub PAT
 ```bash
+# Set up a GitHub PAT with repo read access
+export HOMEBREW_GITHUB_API_TOKEN=your_token_here
+# Add this to your shell config (~/.zshrc or ~/.bashrc) to persist
+
 brew install LottieHQ/tap/bifrost
 ```
-This checks if LottieHQ/tap is already tapped. If not, it automatically runs:
-```
-brew tap LottieHQ/tap
-```
 
-This clones the repository from `https://github.com/LottieHQ/homebrew-tap` to your local machine at:
-```
-$(brew --repository)/Library/Taps/LottieHQ/homebrew-tap/
-```
-NOTE: git clone will use https by default. If you use ssh keys you can run 
-```
+#### Option 2: SSH
+```bash
 brew tap LottieHQ/tap git@github.com:LottieHQ/homebrew-tap.git
+brew install bifrost
 ```
-and then re-run `brew install LottieHQ/tap/bifrost`.
 
 ## Quick Start
 
