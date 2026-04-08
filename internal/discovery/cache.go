@@ -51,9 +51,8 @@ func SaveCache(ssoProfile string, resources []Resource) error {
 		return err
 	}
 	c := Cache{
-		SSOProfile: ssoProfile,
-		CachedAt:   time.Now(),
-		Resources:  resources,
+		CachedAt:  time.Now(),
+		Resources: resources,
 	}
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {

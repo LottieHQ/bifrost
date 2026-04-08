@@ -114,25 +114,16 @@ func (p *Prompt) SelectResource(resources []discovery.Resource, profiles []strin
 	var options []huh.Option[string]
 
 	// Add database resources
-	hasDB := false
 	for i, r := range resources {
 		if r.ServiceType == "rds" {
-			if !hasDB {
-				// Group header as a visual prefix on the first item
-				hasDB = true
-			}
 			label := fmt.Sprintf("📦 %s — %s (%s:%d)", r.AccountName, r.Name, r.Engine, r.Port)
 			options = append(options, huh.NewOption(label, fmt.Sprintf("resource:%d", i)))
 		}
 	}
 
 	// Add redis resources
-	hasRedis := false
 	for i, r := range resources {
 		if r.ServiceType == "redis" {
-			if !hasRedis {
-				hasRedis = true
-			}
 			label := fmt.Sprintf("🔴 %s — %s (redis:%d)", r.AccountName, r.Name, r.Port)
 			options = append(options, huh.NewOption(label, fmt.Sprintf("resource:%d", i)))
 		}

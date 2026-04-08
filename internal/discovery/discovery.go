@@ -9,7 +9,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/elasticache"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
@@ -75,7 +74,7 @@ func discoverAccount(
 	}
 
 	// Get credentials
-	cfg, err := buildAWSConfig(ctx, ssoRegion, token, accountID, roleName, region)
+	cfg, err := BuildAWSConfig(ctx, ssoRegion, token, accountID, roleName, region)
 	if err != nil {
 		return nil, fmt.Errorf("credentials: %w", err)
 	}
@@ -85,7 +84,6 @@ func discoverAccount(
 		rdsResources   []Resource
 		redisResources []Resource
 		bastionID      string
-		bastionName    string
 	)
 
 	ig, ictx := errgroup.WithContext(ctx)
@@ -93,8 +91,7 @@ func discoverAccount(
 	ig.Go(func() error {
 		r, err := discoverRDS(ictx, cfg, accountID, accountName, roleName, region)
 		if err != nil {
-			log.Printf("Warning: RDS discovery failed for %s: %v", accountName, err)
-			return nil
+			return fmt.Errorf("RDS discovery failed for %s: %w", accountName, err)
 		}
 		rdsResources = r
 		return nil
@@ -103,21 +100,18 @@ func discoverAccount(
 	ig.Go(func() error {
 		r, err := discoverRedis(ictx, cfg, accountID, accountName, roleName, region)
 		if err != nil {
-			log.Printf("Warning: Redis discovery failed for %s: %v", accountName, err)
-			return nil
+			return fmt.Errorf("Redis discovery failed for %s: %w", accountName, err)
 		}
 		redisResources = r
 		return nil
 	})
 
 	ig.Go(func() error {
-		id, name, err := discoverBastion(ictx, cfg)
+		id, err := discoverBastion(ictx, cfg)
 		if err != nil {
-			log.Printf("Warning: bastion discovery failed for %s: %v", accountName, err)
-			return nil
+			return fmt.Errorf("bastion discovery failed for %s: %w", accountName, err)
 		}
 		bastionID = id
-		bastionName = name
 		return nil
 	})
 
@@ -129,7 +123,6 @@ func discoverAccount(
 	var results []Resource
 	for _, r := range append(rdsResources, redisResources...) {
 		r.BastionID = bastionID
-		r.BastionName = bastionName
 		results = append(results, r)
 	}
 	return results, nil
@@ -157,7 +150,8 @@ func selectRole(ctx context.Context, ssoRegion string, token *ssooidc.CreateToke
 	return *out.RoleList[0].RoleName, nil
 }
 
-func buildAWSConfig(ctx context.Context, ssoRegion string, token *ssooidc.CreateTokenOutput, accountID, roleName, region string) (aws.Config, error) {
+// BuildAWSConfig creates an aws.Config using SSO role credentials for the given account.
+func BuildAWSConfig(ctx context.Context, ssoRegion string, token *ssooidc.CreateTokenOutput, accountID, roleName, region string) (aws.Config, error) {
 	ssoClient := sso.NewFromConfig(aws.Config{Region: ssoRegion})
 	creds, err := ssoClient.GetRoleCredentials(ctx, &sso.GetRoleCredentialsInput{
 		AccessToken: token.AccessToken,
@@ -180,21 +174,21 @@ func buildAWSConfig(ctx context.Context, ssoRegion string, token *ssooidc.Create
 
 func discoverRDS(ctx context.Context, cfg aws.Config, accountID, accountName, roleName, region string) ([]Resource, error) {
 	client := rds.NewFromConfig(cfg)
-	out, err := client.DescribeDBInstances(ctx, &rds.DescribeDBInstancesInput{})
+	out, err := client.DescribeDBClusters(ctx, &rds.DescribeDBClustersInput{})
 	if err != nil {
 		return nil, err
 	}
 
 	var resources []Resource
-	for _, db := range out.DBInstances {
-		if db.DBInstanceIdentifier == nil || db.Endpoint == nil {
+	for _, cluster := range out.DBClusters {
+		if cluster.DBClusterIdentifier == nil || cluster.Endpoint == nil {
 			continue
 		}
 
 		// Check for bifrost:iam-auth tag
 		iamAuth := false
 		tags, err := client.ListTagsForResource(ctx, &rds.ListTagsForResourceInput{
-			ResourceName: db.DBInstanceArn,
+			ResourceName: cluster.DBClusterArn,
 		})
 		if err == nil {
 			for _, tag := range tags.TagList {
@@ -206,8 +200,13 @@ func discoverRDS(ctx context.Context, cfg aws.Config, accountID, accountName, ro
 		}
 
 		engine := "unknown"
-		if db.Engine != nil {
-			engine = *db.Engine
+		if cluster.Engine != nil {
+			engine = *cluster.Engine
+		}
+
+		var port int32 = 5432
+		if cluster.Port != nil {
+			port = *cluster.Port
 		}
 
 		resources = append(resources, Resource{
@@ -216,10 +215,10 @@ func discoverRDS(ctx context.Context, cfg aws.Config, accountID, accountName, ro
 			RoleName:       roleName,
 			Region:         region,
 			ServiceType:    "rds",
-			Name:           *db.DBInstanceIdentifier,
+			Name:           *cluster.DBClusterIdentifier,
 			Engine:         engine,
-			Port:           *db.Endpoint.Port,
-			Endpoint:       *db.Endpoint.Address,
+			Port:           port,
+			Endpoint:       *cluster.Endpoint,
 			IAMAuthEnabled: iamAuth,
 		})
 	}
@@ -261,43 +260,18 @@ func discoverRedis(ctx context.Context, cfg aws.Config, accountID, accountName, 
 	return resources, nil
 }
 
-func discoverBastion(ctx context.Context, cfg aws.Config) (string, string, error) {
+func discoverBastion(ctx context.Context, cfg aws.Config) (string, error) {
 	ssmClient := ssm.NewFromConfig(cfg)
 	out, err := ssmClient.DescribeInstanceInformation(ctx, &ssm.DescribeInstanceInformationInput{})
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 
 	// Find first online instance
-	var instanceID string
 	for _, inst := range out.InstanceInformationList {
 		if inst.PingStatus == ssmtypes.PingStatusOnline && inst.InstanceId != nil {
-			instanceID = *inst.InstanceId
-			break
+			return *inst.InstanceId, nil
 		}
 	}
-	if instanceID == "" {
-		return "", "", nil // no bastion found, not an error
-	}
-
-	// Get Name tag
-	ec2Client := ec2.NewFromConfig(cfg)
-	desc, err := ec2Client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
-		InstanceIds: []string{instanceID},
-	})
-	if err != nil {
-		return instanceID, "", nil // return ID without name
-	}
-
-	var name string
-	for _, res := range desc.Reservations {
-		for _, inst := range res.Instances {
-			for _, tag := range inst.Tags {
-				if *tag.Key == "Name" {
-					name = *tag.Value
-				}
-			}
-		}
-	}
-	return instanceID, name, nil
+	return "", nil // no bastion found, not an error
 }

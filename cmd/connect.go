@@ -18,8 +18,6 @@ import (
 
 	"github.com/atotto/clipboard"
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/rds/auth"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/elasticache"
@@ -292,25 +290,7 @@ func runDiscoveredConnect(
 
 	// Get credentials for the resource's account
 	ctx := context.Background()
-	ssoSvc := ssosdk.NewFromConfig(aws.Config{Region: ssoRegion})
-	roleCreds, err := ssoSvc.GetRoleCredentials(ctx, &ssosdk.GetRoleCredentialsInput{
-		AccessToken: token.AccessToken,
-		AccountId:   aws.String(res.AccountID),
-		RoleName:    aws.String(res.RoleName),
-	})
-	if err != nil {
-		fmt.Printf("Error getting credentials: %v\n", err)
-		os.Exit(1)
-	}
-
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion(region),
-		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			*roleCreds.RoleCredentials.AccessKeyId,
-			*roleCreds.RoleCredentials.SecretAccessKey,
-			*roleCreds.RoleCredentials.SessionToken,
-		)),
-	)
+	awsCfg, err := discovery.BuildAWSConfig(ctx, ssoRegion, token, res.AccountID, res.RoleName, region)
 	if err != nil {
 		fmt.Printf("Error creating AWS config: %v\n", err)
 		os.Exit(1)
@@ -330,15 +310,8 @@ func runDiscoveredConnect(
 	// IAM auth for tagged RDS resources
 	var iamAuthUser string
 	if res.IAMAuthEnabled && res.ServiceType == "rds" {
-		// Get username from STS
-		stsSvc := sts.NewFromConfig(awsCfg)
-		identity, err := stsSvc.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
-		if err == nil && identity.Arn != nil {
-			parts := strings.Split(*identity.Arn, "/")
-			if len(parts) >= 3 {
-				username := parts[len(parts)-1]
-				iamAuthUser = promptForAuthMethod(username, prompt)
-			}
+		if username := getUsernameFromSTS(awsCfg); username != "" {
+			iamAuthUser = promptForAuthMethod(username, prompt)
 		}
 	}
 
@@ -416,9 +389,13 @@ func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort str
 		}
 		fmt.Printf("🔑 IAM auth token generated for %s (expires in ~15 min)\n\n", iamAuthUser)
 		fmt.Printf("  psql:\n")
-		fmt.Printf("    PGPASSWORD='%s' psql -h localhost -p %s -U '%s' -d postgres\n\n", token, localPort, iamAuthUser)
+		fmt.Printf("    PGPASSWORD='<clipboard>' psql -h localhost -p %s -U '%s' -d postgres\n\n", localPort, iamAuthUser)
 		if err := clipboard.WriteAll(token); err == nil {
-			fmt.Println("  📋 Token copied to clipboard")
+			fmt.Println("  📋 Token copied to clipboard (clears in 30s)")
+			go func() {
+				time.Sleep(30 * time.Second)
+				clipboard.WriteAll("")
+			}()
 		}
 		fmt.Println()
 	}
@@ -572,35 +549,9 @@ func getAWSConfigWithToken(ssoProfileName, ssoRegion string, token *ssooidc.Crea
 	}
 	fmt.Printf("👤 Role: %s\n", roleName)
 
-	roleCreds, err := ssoSvc.GetRoleCredentials(ctx, &ssosdk.GetRoleCredentialsInput{
-		AccessToken: token.AccessToken,
-		AccountId:   aws.String(accountId),
-		RoleName:    aws.String(roleName),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to get role credentials: %v", err)
-	}
-
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion(region),
-		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			*roleCreds.RoleCredentials.AccessKeyId,
-			*roleCreds.RoleCredentials.SecretAccessKey,
-			*roleCreds.RoleCredentials.SessionToken,
-		)),
-	)
+	awsCfg, err := discovery.BuildAWSConfig(ctx, ssoRegion, token, accountId, roleName, region)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create AWS config: %v", err)
-	}
-
-	var username string
-	stsSvc := sts.NewFromConfig(awsCfg)
-	identity, err := stsSvc.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
-	if err == nil && identity.Arn != nil {
-		parts := strings.Split(*identity.Arn, "/")
-		if len(parts) >= 3 {
-			username = parts[len(parts)-1]
-		}
 	}
 
 	return &awsSession{
@@ -608,7 +559,7 @@ func getAWSConfigWithToken(ssoProfileName, ssoRegion string, token *ssooidc.Crea
 		AccountID:   accountId,
 		AccountName: accountName,
 		RoleName:    roleName,
-		Username:    username,
+		Username:    getUsernameFromSTS(awsCfg),
 	}, nil
 }
 
@@ -626,104 +577,40 @@ func (s *awsSession) isKubernetesAccount() bool {
 	return strings.Contains(strings.ToLower(s.AccountName), "kubernetes")
 }
 
-// Check and load AWS credentials using SSO profile
+// getAWSConfig authenticates via SSO and returns an AWS session.
+// It authenticates first, then delegates to getAWSConfigWithToken.
 func getAWSConfig(ssoProfileName, region, accountId, roleName string) (*awsSession, error) {
 	ctx := context.Background()
 	cfgManager := config.NewManager()
 	prompt := ui.NewPrompt()
 
-	// Get SSO profile
 	ssoProfile, err := cfgManager.GetSSOProfile(ssoProfileName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get SSO profile '%s': %v", ssoProfileName, err)
 	}
 
-	// Initialize SSO client
 	ssoClient := sso.NewClient(ssoProfile.SSORegion, ssoProfile.StartURL)
-
-	// Authenticate and get token
 	token, err := ssoClient.Authenticate(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("authentication failed: %v", err)
 	}
 
-	// Always list accounts so we can get the account name
-	accounts, err := ssoClient.ListAccounts(ctx, token)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list accounts: %v", err)
+	return getAWSConfigWithToken(ssoProfileName, ssoProfile.SSORegion, token, region, accountId, roleName, prompt)
+}
+
+// getUsernameFromSTS extracts the username from the STS caller identity ARN.
+// ARN format: arn:aws:sts::ACCOUNT:assumed-role/ROLE/username@domain.com
+func getUsernameFromSTS(cfg aws.Config) string {
+	stsSvc := sts.NewFromConfig(cfg)
+	identity, err := stsSvc.GetCallerIdentity(context.Background(), &sts.GetCallerIdentityInput{})
+	if err != nil || identity.Arn == nil {
+		return ""
 	}
-
-	var accountName string
-	if accountId == "" {
-		// Select account interactively
-		_, accountId, err = prompt.SelectAccount(accounts)
-		if err != nil {
-			return nil, fmt.Errorf("failed to select account: %v", err)
-		}
+	parts := strings.Split(*identity.Arn, "/")
+	if len(parts) >= 3 {
+		return parts[len(parts)-1]
 	}
-
-	// Find account name from the list
-	for _, acc := range accounts.AccountList {
-		if *acc.AccountId == accountId {
-			accountName = *acc.AccountName
-			break
-		}
-	}
-	fmt.Printf("🪪 Account: %s (%s)\n", accountName, accountId)
-
-	// List roles if role name not provided
-	if roleName == "" {
-		roles, err := ssoClient.ListAccountRoles(ctx, token, accountId)
-		if err != nil {
-			return nil, fmt.Errorf("failed to list roles: %v", err)
-		}
-
-		// Select role
-		roleName, err = prompt.SelectRole(roles)
-		if err != nil {
-			return nil, fmt.Errorf("failed to select role: %v", err)
-		}
-	}
-	fmt.Printf("👤 Role: %s\n", roleName)
-
-	// Get role credentials
-	roleCreds, err := ssoClient.GetRoleCredentials(ctx, token, accountId, roleName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get role credentials: %v", err)
-	}
-
-	// Create AWS config with the role credentials and region
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion(region),
-		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			*roleCreds.RoleCredentials.AccessKeyId,
-			*roleCreds.RoleCredentials.SecretAccessKey,
-			*roleCreds.RoleCredentials.SessionToken,
-		)),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create AWS config: %v", err)
-	}
-
-	// Get username from STS GetCallerIdentity
-	// ARN format: arn:aws:sts::ACCOUNT:assumed-role/ROLE/username@domain.com
-	var username string
-	stsSvc := sts.NewFromConfig(awsCfg)
-	identity, err := stsSvc.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
-	if err == nil && identity.Arn != nil {
-		parts := strings.Split(*identity.Arn, "/")
-		if len(parts) >= 3 {
-			username = parts[len(parts)-1]
-		}
-	}
-
-	return &awsSession{
-		Config:      awsCfg,
-		AccountID:   accountId,
-		AccountName: accountName,
-		RoleName:    roleName,
-		Username:    username,
-	}, nil
+	return ""
 }
 
 // isBastionConnected checks if a bastion instance is reachable via SSM
