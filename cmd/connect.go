@@ -365,12 +365,22 @@ func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort str
 			os.Exit(1)
 		}
 		fmt.Printf("🔑 IAM auth token generated for %s (expires in ~15 min)\n\n", iamAuthUser)
+		psqlCmd := fmt.Sprintf("PGPASSWORD='%s' psql -h localhost -p %s -U '%s' -d postgres", token, localPort, iamAuthUser)
 		fmt.Printf("  psql:\n")
-		fmt.Printf("    PGPASSWORD='%s' psql -h localhost -p %s -U '%s' -d postgres\n\n", token, localPort, iamAuthUser)
-		if err := clipboard.WriteAll(token); err == nil {
-			fmt.Println("  📋 Token copied to clipboard")
+		fmt.Printf("    %s\n\n", psqlCmd)
+		if err := clipboard.WriteAll(psqlCmd); err == nil {
+			fmt.Println("  📋 Copied to clipboard")
 		}
 		fmt.Println()
+		if strings.HasPrefix(iamAuthUser, "su-") {
+			fmt.Println("  ┌───────────────────────────────────────────────────┐")
+			fmt.Println("  │  ⚠️  Admin access requires membership of the      │")
+			fmt.Println("  │  infra-aws-database-admins Google group.          │")
+			fmt.Println("  │  A token will be generated but authentication     │")
+			fmt.Println("  │  will fail if you are not a member.               │")
+			fmt.Println("  └───────────────────────────────────────────────────┘")
+			fmt.Println()
+		}
 	}
 
 	fmt.Printf("📝 Press Ctrl+C to stop the connection\n\n")
@@ -398,7 +408,6 @@ func promptForAuthMethod(username string, prompt *ui.Prompt) string {
 	}
 	switch {
 	case strings.HasPrefix(authMethod, "🔑 IAM Admin"):
-		fmt.Println("⚠️  Requires infra-aws-database-admins group membership")
 		return "su-" + username
 	case strings.HasPrefix(authMethod, "🔑 IAM ("):
 		return username

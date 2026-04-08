@@ -3,9 +3,11 @@ package ui
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/sso"
 	"github.com/charmbracelet/huh"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/LottieHQ/bifrost/internal/discovery"
 )
 
@@ -94,6 +96,8 @@ func (p *Prompt) SelectRole(roles *sso.ListAccountRolesOutput) (string, error) {
 
 const manualSetupKey = "__manual__"
 
+var dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("248"))
+
 // SelectResource presents discovered resources grouped by service type,
 // plus any saved connection profiles and a "Manual setup" option.
 // Returns the selected resource (nil if manual/profile chosen) and the
@@ -118,7 +122,7 @@ func (p *Prompt) SelectResource(resources []discovery.Resource, profiles []strin
 	for i, r := range resources {
 		if r.ServiceType == "rds" {
 			if !hasDB {
-				options = append(options, huh.NewOption("── Databases ──────────────", "__sep_db__"))
+				options = append(options, huh.NewOption(dimStyle.Render("── Databases ─────────────────────"), "__sep_db__"))
 				hasDB = true
 			}
 			label := fmt.Sprintf("  📦 %s — %s (%s:%d)", r.AccountName, r.Name, r.Engine, r.Port)
@@ -131,58 +135,65 @@ func (p *Prompt) SelectResource(resources []discovery.Resource, profiles []strin
 	for i, r := range resources {
 		if r.ServiceType == "redis" {
 			if !hasRedis {
-				options = append(options, huh.NewOption("── Redis ──────────────────", "__sep_redis__"))
+				options = append(options, huh.NewOption(dimStyle.Render("── Redis ─────────────────────────"), "__sep_redis__"))
 				hasRedis = true
 			}
-			label := fmt.Sprintf("  🔴 %s — %s (redis:%d)", r.AccountName, r.Name, r.Port)
+			label := fmt.Sprintf("  🔶 %s — %s (redis:%d)", r.AccountName, r.Name, r.Port)
 			options = append(options, huh.NewOption(label, fmt.Sprintf("resource:%d", i)))
 		}
 	}
 
 	// Add saved profiles
 	if len(profiles) > 0 {
-		options = append(options, huh.NewOption("── Saved Profiles ────────", "__sep_profiles__"))
+		options = append(options, huh.NewOption(dimStyle.Render("── Saved Profiles ────────────────"), "__sep_profiles__"))
 		for _, name := range profiles {
 			label := fmt.Sprintf("  🔗 %s", name)
 			options = append(options, huh.NewOption(label, "profile:"+name))
 		}
 	}
 
-	// Separator before manual setup
-	options = append(options, huh.NewOption("──────────────────────────", "__sep_manual__"))
+	// Manual setup
+	options = append(options, huh.NewOption(dimStyle.Render("──────────────────────────────────"), "__sep_manual__"))
 	options = append(options, huh.NewOption("  ⚙️  Manual setup", manualSetupKey))
 
-	var selected string
-	form := huh.NewForm(
-		huh.NewGroup(
-			huh.NewSelect[string]().
-				Title("Select a connection").
-				Options(options...).
-				Value(&selected),
-		),
-	)
+	for {
+		var selected string
+		form := huh.NewForm(
+			huh.NewGroup(
+				huh.NewSelect[string]().
+					Title("Select a connection (press / to filter)").
+					Options(options...).
+					Value(&selected),
+			),
+		)
 
-	if err := form.Run(); err != nil {
-		return nil, "", fmt.Errorf("select failed: %w", err)
-	}
+		if err := form.Run(); err != nil {
+			return nil, "", fmt.Errorf("select failed: %w", err)
+		}
 
-	// Parse selection
-	if selected == manualSetupKey {
+		// If a separator was selected, re-prompt
+		if strings.HasPrefix(selected, "__sep_") {
+			continue
+		}
+
+		// Parse selection
+		if selected == manualSetupKey {
+			return nil, "", nil
+		}
+
+		var idx int
+		if _, err := fmt.Sscanf(selected, "resource:%d", &idx); err == nil {
+			r := resources[idx]
+			return &r, "", nil
+		}
+
+		var profileName string
+		if _, err := fmt.Sscanf(selected, "profile:%s", &profileName); err == nil {
+			return nil, profileName, nil
+		}
+
 		return nil, "", nil
 	}
-
-	var idx int
-	if _, err := fmt.Sscanf(selected, "resource:%d", &idx); err == nil {
-		r := resources[idx]
-		return &r, "", nil
-	}
-
-	var profileName string
-	if _, err := fmt.Sscanf(selected, "profile:%s", &profileName); err == nil {
-		return nil, profileName, nil
-	}
-
-	return nil, "", nil
 }
 
 // Confirm prompts the user for a yes/no confirmation
