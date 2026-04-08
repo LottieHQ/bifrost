@@ -34,6 +34,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const defaultSSORegion = "us-east-1"
+const defaultSSOStartURL = "https://d-906785ee68.awsapps.com/start"
+
 // connectCmd represents the connect command
 var connectCmd = &cobra.Command{
 	Use:   "connect",
@@ -71,7 +74,7 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 				os.Exit(1)
 			}
 			fmt.Printf("🔗 Using connection profile: %s\n", profileFlag)
-			runProfileConnect(cmd, profile, prompt, cfgManager, regionFlag, keepAliveFlag, keepAliveInterval)
+			runProfileConnect(profile, prompt, regionFlag, keepAliveFlag, keepAliveInterval)
 			return
 		}
 
@@ -89,8 +92,8 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 			ssoClient = sso.NewClient(profile.SSORegion, profile.StartURL)
 		} else {
 			// Default Lottie SSO endpoint
-			ssoRegion = "us-east-1"
-			ssoClient = sso.NewClient(ssoRegion, "https://d-906785ee68.awsapps.com/start")
+			ssoRegion = defaultSSORegion
+			ssoClient = sso.NewClient(ssoRegion, defaultSSOStartURL)
 		}
 		ctx := context.Background()
 		token, err := ssoClient.Authenticate(ctx)
@@ -151,7 +154,7 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 						os.Exit(1)
 					}
 					fmt.Printf("🔗 Using connection profile: %s\n", selectedProfileName)
-					runProfileConnect(cmd, profile, prompt, cfgManager, regionFlag, keepAliveFlag, keepAliveInterval)
+					runProfileConnect(profile, prompt, regionFlag, keepAliveFlag, keepAliveInterval)
 					return
 				}
 
@@ -225,12 +228,8 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 			os.Exit(1)
 		}
 
-		var iamAuthUser string
-		if serviceTypeFlag == "rds" && session.isKubernetesAccount() && session.Username != "" {
-			iamAuthUser = promptForAuthMethod(session.Username, prompt)
-		}
-
-		runConnection(awsCfg, endpoint, port, portFlag, bastionInstanceIDFlag, regionFlag, iamAuthUser, keepAliveFlag, keepAliveInterval)
+		iamEnabled := serviceTypeFlag == "rds" && session.isKubernetesAccount()
+		runConnection(awsCfg, endpoint, port, portFlag, bastionInstanceIDFlag, regionFlag, iamEnabled, session.Username, prompt, keepAliveFlag, keepAliveInterval)
 	},
 }
 
@@ -282,23 +281,17 @@ func runDiscoveredConnect(
 	// Validate bastion
 	bastionID := resolveBastionID(awsCfg, res.BastionID, prompt)
 
-	// IAM auth for tagged RDS resources
-	var iamAuthUser string
-	if res.IAMAuthEnabled && res.ServiceType == "rds" {
-		if username := getUsernameFromSTS(awsCfg); username != "" {
-			iamAuthUser = promptForAuthMethod(username, prompt)
-		}
-	}
+	// Resolve username for IAM auth
+	username := getUsernameFromSTS(awsCfg)
+	iamEnabled := res.IAMAuthEnabled && res.ServiceType == "rds"
 
-	runConnection(awsCfg, res.Endpoint, res.Port, portFlag, bastionID, region, iamAuthUser, keepAlive, keepAliveInterval)
+	runConnection(awsCfg, res.Endpoint, res.Port, portFlag, bastionID, region, iamEnabled, username, prompt, keepAlive, keepAliveInterval)
 }
 
 // runProfileConnect handles connection using a saved profile.
 func runProfileConnect(
-	cmd *cobra.Command,
 	profile *config.ConnectionProfile,
 	prompt *ui.Prompt,
-	cfgManager *config.Manager,
 	regionFlag string,
 	keepAlive bool,
 	keepAliveInterval time.Duration,
@@ -338,57 +331,145 @@ func runProfileConnect(
 		os.Exit(1)
 	}
 
-	var iamAuthUser string
-	if serviceType == "rds" && session.isKubernetesAccount() && session.Username != "" {
-		iamAuthUser = promptForAuthMethod(session.Username, prompt)
-	}
-
-	runConnection(awsCfg, endpoint, port, portFlag, bastionID, regionFlag, iamAuthUser, keepAlive, keepAliveInterval)
+	iamEnabled := serviceType == "rds" && session.isKubernetesAccount()
+	runConnection(awsCfg, endpoint, port, portFlag, bastionID, regionFlag, iamEnabled, session.Username, prompt, keepAlive, keepAliveInterval)
 }
 
-// runConnection handles the final connection: IAM token, port forwarding, keep-alive.
-func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort string, bastionID string, region string, iamAuthUser string, keepAlive bool, keepAliveInterval time.Duration) {
-	fmt.Println()
-	fmt.Println("  ┌───────────────────────────────────────────────────────────┐")
-	fmt.Printf("  │  🔌 Tunnel open on localhost:%-29s│\n", localPort)
-	fmt.Println("  │                                                           │")
-	fmt.Println("  │  You can connect with any database client and credentials │")
-	fmt.Println("  │  (psql, TablePlus, DBeaver, etc.) using localhost as the  │")
-	fmt.Println("  │  host and the port above.                                 │")
-	fmt.Println("  └───────────────────────────────────────────────────────────┘")
+// runConnection starts the SSM tunnel, waits for it to be ready, then optionally
+// prompts for IAM auth and generates a token. This order makes it clear to the
+// user that the tunnel is open before asking about authentication.
+func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort string, bastionID string, region string, iamAuthEnabled bool, username string, prompt *ui.Prompt, keepAlive bool, keepAliveInterval time.Duration) {
+	// Start SSM tunnel in background
+	ssmCmd, errChan, ctx, cancel, sigChan := startSSMTunnel(awsCfg, bastionID, endpoint, port, localPort, region)
+	defer cancel()
+
+	// Wait for tunnel to be ready
+	fmt.Println("\n⏳ Waiting for tunnel...")
+	ready := waitForTunnelReady(ctx, localPort)
+	if !ready {
+		fmt.Println("❌ Tunnel did not become ready within 30 seconds")
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n✅ Tunnel open on localhost:%s\n", localPort)
 	fmt.Println()
 
-	if iamAuthUser != "" {
-		token, err := auth.BuildAuthToken(
-			context.Background(),
-			fmt.Sprintf("%s:%d", endpoint, port),
-			region,
-			iamAuthUser,
-			awsCfg.Credentials,
-		)
-		if err != nil {
-			fmt.Printf("❌ Failed to generate IAM auth token: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("  🔑 IAM token for %s (expires in ~15 min):\n\n", iamAuthUser)
-		psqlCmd := fmt.Sprintf("PGPASSWORD='%s' psql -h localhost -p %s -U '%s' -d postgres", token, localPort, iamAuthUser)
-		fmt.Printf("    %s\n\n", psqlCmd)
-		if err := clipboard.WriteAll(token); err == nil {
-			fmt.Println("  📋 Token copied to clipboard")
-			fmt.Println("  📋 Use as the password in your database client")
-		}
+	// Now that the tunnel is visibly open, offer IAM token generation
+	if iamAuthEnabled && username != "" {
+		fmt.Println("With this tunnel you can connect using any database credentials.")
+		fmt.Println("This database supports IAM authentication — you can optionally")
+		fmt.Println("generate a 15-minute short-lived token by selecting an option below.")
 		fmt.Println()
+		iamAuthUser := promptForAuthMethod(username, prompt)
+		if iamAuthUser != "" {
+			token, err := auth.BuildAuthToken(
+				context.Background(),
+				fmt.Sprintf("%s:%d", endpoint, port),
+				region,
+				iamAuthUser,
+				awsCfg.Credentials,
+			)
+			if err != nil {
+				fmt.Printf("❌ Failed to generate IAM auth token: %v\n", err)
+			} else {
+				fmt.Printf("\n🔑 IAM token for %s (expires in ~15 min):\n\n", iamAuthUser)
+				safeUser := strings.ReplaceAll(iamAuthUser, "'", "'\\''")
+			psqlCmd := fmt.Sprintf("PGPASSWORD='%s' psql -h localhost -p %s -U '%s' -d postgres", token, localPort, safeUser)
+				fmt.Printf("  %s\n\n", psqlCmd)
+				if err := clipboard.WriteAll(token); err == nil {
+					fmt.Println("📋 Token copied to clipboard — use as the password in your database client")
+				}
+				fmt.Println()
+			}
+		}
 	}
 
 	fmt.Printf("📝 Press Ctrl+C to stop the connection\n\n")
 
+	// Start keep alive
 	if keepAlive {
 		fmt.Printf("💓 Keep alive enabled (interval: %v)\n", keepAliveInterval)
+		go startKeepAlive(ctx, localPort, keepAliveInterval)
 	}
-	if err := startSSMPortForwardingWithKeepAlive(awsCfg, bastionID, endpoint, port, localPort, region, keepAlive, keepAliveInterval); err != nil {
-		fmt.Printf("Error starting SSM session: %v\n", err)
+
+	// Wait for SSM to finish or signal
+	select {
+	case err := <-errChan:
+		if err != nil {
+			fmt.Printf("Error: SSM session ended: %v\n", err)
+			os.Exit(1)
+		}
+	case <-sigChan:
+		fmt.Println("\n🛑 Shutting down connection...")
+		cancel()
+		if ssmCmd.Process != nil {
+			_ = ssmCmd.Process.Signal(syscall.SIGTERM)
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+// startSSMTunnel launches the SSM port forwarding subprocess and returns
+// the command, error channel, context, cancel func, and signal channel.
+func startSSMTunnel(cfg aws.Config, instanceID, endpoint string, port int32, localPort string, region string) (*exec.Cmd, chan error, context.Context, context.CancelFunc, chan os.Signal) {
+	ssmArgs := []string{
+		"ssm", "start-session",
+		"--target", instanceID,
+		"--region", region,
+		"--document-name", "AWS-StartPortForwardingSessionToRemoteHost",
+		"--parameters", fmt.Sprintf("host=%s,portNumber=%d,localPortNumber=%s", endpoint, port, localPort),
+	}
+
+	cmd := exec.Command("aws", ssmArgs...)
+
+	creds, err := cfg.Credentials.Retrieve(context.Background())
+	if err != nil {
+		fmt.Printf("Failed to get credentials: %v\n", err)
 		os.Exit(1)
 	}
+
+	cmd.Env = append(os.Environ(),
+		"AWS_ACCESS_KEY_ID="+creds.AccessKeyID,
+		"AWS_SECRET_ACCESS_KEY="+creds.SecretAccessKey,
+		"AWS_SESSION_TOKEN="+creds.SessionToken,
+		"AWS_REGION="+region,
+	)
+
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = nil // suppress SSM session output (Starting session, Waiting for connections, etc.)
+	cmd.Stderr = os.Stderr
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- cmd.Run()
+	}()
+
+	return cmd, errChan, ctx, cancel, sigChan
+}
+
+// waitForTunnelReady polls the local port until the SSM tunnel is accepting connections.
+func waitForTunnelReady(ctx context.Context, localPort string) bool {
+	for range 60 { // 30 seconds at 500ms intervals
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		if err := performKeepAlive(localPort); err == nil {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return false
 }
 
 // promptForAuthMethod asks the user to pick IAM / IAM Admin / Password.
@@ -396,9 +477,9 @@ func promptForAuthMethod(username string, prompt *ui.Prompt) string {
 	authOptions := []string{
 		fmt.Sprintf("🔑 IAM (%s)", username),
 		fmt.Sprintf("🔑 IAM Superuser (su-%s)", username),
-		"🔐 Password (manual)",
+		"⏭️  Skip — I'll use my own credentials",
 	}
-	authMethod, err := prompt.Select("Authentication method", authOptions)
+	authMethod, err := prompt.Select("Generate a token", authOptions)
 	if err != nil {
 		fmt.Printf("Error selecting auth method: %v\n", err)
 		os.Exit(1)
@@ -406,15 +487,17 @@ func promptForAuthMethod(username string, prompt *ui.Prompt) string {
 	switch {
 	case strings.HasPrefix(authMethod, "🔑 IAM Superuser"):
 		fmt.Println()
-		fmt.Println("  Superuser requires the infra-aws-database-admins Google group.")
-		fmt.Println("  If you are not a member, a token will still be generated but")
-		fmt.Println("  the su- database user won't exist and authentication will fail.")
-		fmt.Println()
-		fmt.Println("  Check membership: https://groups.google.com/a/lottie.org/g/infra-aws-database-admins/members")
+		fmt.Println("  ⚠️  ┌──────────────────────────────────────────────────────────────────────────────────────┐")
+		fmt.Println("  ⚠️  │  Superuser requires the infra-aws-database-admins Google group.                      │")
+		fmt.Println("  ⚠️  │  If you are not a member, a token will still be generated but the su- database       │")
+		fmt.Println("  ⚠️  │  user won't exist and authentication will fail.                                      │")
+		fmt.Println("  ⚠️  │                                                                                      │")
+		fmt.Println("  ⚠️  │  Check: https://groups.google.com/a/lottie.org/g/infra-aws-database-admins/members   │")
+		fmt.Println("  ⚠️  └──────────────────────────────────────────────────────────────────────────────────────┘")
 		fmt.Println()
 		confirmed, err := prompt.Confirm("Continue with superuser?")
 		if err != nil || !confirmed {
-			fmt.Println("  Using standard IAM auth instead")
+			fmt.Println("Using standard IAM auth instead")
 			return username
 		}
 		return "su-" + username
@@ -584,8 +667,8 @@ func getAWSConfig(ssoProfileName, region, accountId, roleName string) (*awsSessi
 		ssoRegion = ssoProfile.SSORegion
 		startURL = ssoProfile.StartURL
 	} else {
-		ssoRegion = "us-east-1"
-		startURL = "https://d-906785ee68.awsapps.com/start"
+		ssoRegion = defaultSSORegion
+		startURL = defaultSSOStartURL
 	}
 
 	ssoClient := sso.NewClient(ssoRegion, startURL)
@@ -815,108 +898,6 @@ func getRedisEndpoint(cfg aws.Config, clusterName string) (string, int32, error)
 
 	fmt.Printf("🎯 Connecting to Redis cluster: %s\n", *cluster.ReplicationGroupId)
 	return *cluster.NodeGroups[0].PrimaryEndpoint.Address, int32(*cluster.NodeGroups[0].PrimaryEndpoint.Port), nil
-}
-
-// Start SSM port forwarding session with keep alive functionality
-func startSSMPortForwardingWithKeepAlive(cfg aws.Config, instanceID, endpoint string, port int32, localPort string, workloadRegion string, keepAlive bool, keepAliveInterval time.Duration) error {
-	// Construct the SSM command
-	ssmArgs := []string{
-		"ssm", "start-session",
-		"--target", instanceID,
-		"--region", workloadRegion,
-		"--document-name", "AWS-StartPortForwardingSessionToRemoteHost",
-		"--parameters", fmt.Sprintf("host=%s,portNumber=%d,localPortNumber=%s", endpoint, port, localPort),
-	}
-
-	// Create command
-	cmd := exec.Command("aws", ssmArgs...)
-
-	// Get AWS credentials from the config
-	creds, err := cfg.Credentials.Retrieve(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to get credentials from config: %w", err)
-	}
-
-	// Set AWS credentials from the config
-	cmd.Env = append(os.Environ(),
-		"AWS_ACCESS_KEY_ID="+creds.AccessKeyID,
-		"AWS_SECRET_ACCESS_KEY="+creds.SecretAccessKey,
-		"AWS_SESSION_TOKEN="+creds.SessionToken,
-		"AWS_REGION="+workloadRegion,
-	)
-
-	// Connect stdin/stdout/stderr
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	// Set up signal handling for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Handle interrupt signals
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Start the SSM session in a goroutine
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- cmd.Run()
-	}()
-
-	// Start keep alive functionality if enabled (wait for SSM tunnel to be ready)
-	if keepAlive {
-		go startKeepAliveWhenReady(ctx, localPort, keepAliveInterval)
-	}
-
-	// Wait for either the command to finish, an error, or a signal
-	select {
-	case err := <-errChan:
-		return err
-	case <-sigChan:
-		fmt.Println("\n🛑 Shutting down connection...")
-		cancel()
-
-		// Terminate the SSM process
-		if cmd.Process != nil {
-			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-				fmt.Printf("Warning: failed to send termination signal: %v\n", err)
-			}
-		}
-
-		// Wait a bit for graceful shutdown
-		time.Sleep(1 * time.Second)
-		return nil
-	}
-}
-
-// Start keep alive when SSM tunnel becomes ready (no arbitrary delay)
-func startKeepAliveWhenReady(ctx context.Context, localPort string, interval time.Duration) {
-	// Poll until the SSM tunnel is ready (check every 500ms for up to 30 seconds)
-	maxAttempts := 60 // 30 seconds with 500ms intervals
-	for range maxAttempts {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		if err := performKeepAlive(localPort); err == nil {
-			// Connection successful, start regular keep alive
-			startKeepAlive(ctx, localPort, interval)
-			return
-		}
-
-		// Wait 500ms before retrying
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-
-	// If we get here, the tunnel never became ready
-	fmt.Printf("⚠️ Keep alive disabled - SSM tunnel did not become ready within 30 seconds\n")
 }
 
 // Keep alive functionality
