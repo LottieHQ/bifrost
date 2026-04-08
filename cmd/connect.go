@@ -389,13 +389,9 @@ func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort str
 		}
 		fmt.Printf("🔑 IAM auth token generated for %s (expires in ~15 min)\n\n", iamAuthUser)
 		fmt.Printf("  psql:\n")
-		fmt.Printf("    PGPASSWORD='<clipboard>' psql -h localhost -p %s -U '%s' -d postgres\n\n", localPort, iamAuthUser)
+		fmt.Printf("    PGPASSWORD='%s' psql -h localhost -p %s -U '%s' -d postgres\n\n", token, localPort, iamAuthUser)
 		if err := clipboard.WriteAll(token); err == nil {
-			fmt.Println("  📋 Token copied to clipboard (clears in 30s)")
-			go func() {
-				time.Sleep(30 * time.Second)
-				clipboard.WriteAll("")
-			}()
+			fmt.Println("  📋 Token copied to clipboard")
 		}
 		fmt.Println()
 	}
