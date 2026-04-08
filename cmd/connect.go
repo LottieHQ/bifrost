@@ -14,14 +14,19 @@ import (
 	"syscall"
 	"time"
 
+	"strings"
+
+	"github.com/atotto/clipboard"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/rds/auth"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/elasticache"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/aws-sdk-go-v2/service/ssm/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/LottieHQ/bifrost/internal/config"
 	"github.com/LottieHQ/bifrost/internal/sso"
 	"github.com/LottieHQ/bifrost/internal/ui"
@@ -162,22 +167,20 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 			}
 		}
 
-		// Prompt for region if not provided
+		// Default region to eu-west-2 if not provided
 		if regionFlag == "" {
-			result, err := prompt.Input("AWS region (where your RDS/Redis instances are)", nil)
-			if err != nil {
-				fmt.Printf("Error: %v\n", err)
-				os.Exit(1)
-			}
-			regionFlag = result
+			regionFlag = "eu-west-2"
 		}
 
 		// 1. Check AWS credentials
-		awsCfg, accountIdFlag, roleNameFlag, err := getAWSConfig(ssoProfileFlag, regionFlag, accountIdFlag, roleNameFlag)
+		session, err := getAWSConfig(ssoProfileFlag, regionFlag, accountIdFlag, roleNameFlag)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
+		awsCfg := session.Config
+		accountIdFlag = session.AccountID
+		roleNameFlag = session.RoleName
 
 		// Check service type
 
@@ -207,38 +210,43 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 		}
 		fmt.Printf("🌐 Port: %s\n", portFlag)
 
-		// 2. Prompt for bastion instance ID if not provided
+		// 2. Auto-discover or prompt for bastion instance ID
+		// If a bastion ID was provided (from profile or flag), validate it's reachable
+		if bastionInstanceIDFlag != "" {
+			if !isBastionConnected(awsCfg, bastionInstanceIDFlag) {
+				fmt.Printf("⚠️  Bastion %s is not connected, discovering available instances...\n", bastionInstanceIDFlag)
+				bastionInstanceIDFlag = ""
+			}
+		}
+
 		if bastionInstanceIDFlag == "" {
-			result, err := prompt.Input("Enter bastion EC2 instance ID (or leave empty to browse)", nil)
+			instances, instanceMap, err := listSSMManagedInstances(awsCfg)
 			if err != nil {
-				fmt.Printf("Error: %v\n", err)
+				fmt.Printf("Error listing SSM managed instances: %v\n", err)
 				os.Exit(1)
 			}
 
-			// If user left it empty, show available SSM managed instances
-			if result == "" {
-				instances, instanceMap, err := listSSMManagedInstances(awsCfg)
-				if err != nil {
-					fmt.Printf("Error listing SSM managed instances: %v\n", err)
-					os.Exit(1)
-				}
+			if len(instances) == 0 {
+				fmt.Println("No SSM managed instances found in this region.")
+				os.Exit(1)
+			}
 
-				if len(instances) == 0 {
-					fmt.Println("No SSM managed instances found in this region.")
-					os.Exit(1)
-				}
-
+			if len(instances) == 1 {
+				// Auto-select the only bastion
+				bastionInstanceIDFlag = instanceMap[instances[0]]
+				fmt.Printf("🏰 Auto-selected bastion: %s\n", instances[0])
+			} else {
 				selected, err := prompt.Select("Select bastion instance", instances)
 				if err != nil {
 					fmt.Printf("Error selecting bastion instance: %v\n", err)
 					os.Exit(1)
 				}
 				bastionInstanceIDFlag = instanceMap[selected]
-			} else {
-				bastionInstanceIDFlag = result
+				fmt.Printf("🏰 Using bastion instance: %s\n", bastionInstanceIDFlag)
 			}
+		} else {
+			fmt.Printf("🏰 Using bastion instance: %s\n", bastionInstanceIDFlag)
 		}
-		fmt.Printf("🏰 Using bastion instance: %s\n", bastionInstanceIDFlag)
 
 		// Get endpoint based on service type
 		var endpoint string
@@ -320,7 +328,30 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 			os.Exit(1)
 		}
 
-		// 4. Offer to save as profile if manual setup was used (before starting SSM session)
+		// 4. IAM auth for kubernetes accounts (RDS only)
+		var iamAuthUser string
+		if serviceTypeFlag == "rds" && session.isKubernetesAccount() && session.Username != "" {
+			authOptions := []string{
+				fmt.Sprintf("🔑 IAM (%s)", session.Username),
+				fmt.Sprintf("🔑 IAM Admin (su-%s)", session.Username),
+				"🔐 Password (manual)",
+			}
+			authMethod, err := prompt.Select("Authentication method", authOptions)
+			if err != nil {
+				fmt.Printf("Error selecting auth method: %v\n", err)
+				os.Exit(1)
+			}
+
+			switch {
+			case strings.HasPrefix(authMethod, "🔑 IAM Admin"):
+				fmt.Println("⚠️  Requires approved aws-db-admin request via Ravenna")
+				iamAuthUser = "su-" + session.Username
+			case strings.HasPrefix(authMethod, "🔑 IAM ("):
+				iamAuthUser = session.Username
+			}
+		}
+
+		// 5. Offer to save as profile if manual setup was used (before starting SSM session)
 		if selectedProfile == nil { // Only for manual setup
 			// Get the actual resource names that were used
 			var rdsName, redisName string
@@ -332,7 +363,32 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 			offerToSaveProfile(cfgManager, prompt, ssoProfileFlag, accountIdFlag, roleNameFlag, regionFlag, serviceTypeFlag, portFlag, bastionInstanceIDFlag, rdsName, redisName)
 		}
 
-		fmt.Printf("🔌 Forwarding `%s` to 127.0.0.1:%s (use this as host in your app or client)\n", serviceTypeFlag, portFlag)
+		fmt.Printf("\n🔌 Forwarding `%s` to 127.0.0.1:%s\n", serviceTypeFlag, portFlag)
+
+		// Generate and display IAM auth token if selected
+		if iamAuthUser != "" {
+			token, err := auth.BuildAuthToken(
+				context.Background(),
+				fmt.Sprintf("%s:%d", endpoint, port),
+				regionFlag,
+				iamAuthUser,
+				awsCfg.Credentials,
+			)
+			if err != nil {
+				fmt.Printf("❌ Failed to generate IAM auth token: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Printf("🔑 IAM auth token generated for %s (expires in ~15 min)\n\n", iamAuthUser)
+			fmt.Printf("  psql:\n")
+			fmt.Printf("    PGPASSWORD='%s' psql -h localhost -p %s -U '%s' -d postgres\n\n", token, portFlag, iamAuthUser)
+
+			if err := clipboard.WriteAll(token); err == nil {
+				fmt.Println("  📋 Token copied to clipboard")
+			}
+			fmt.Println()
+		}
+
 		fmt.Printf("📝 Press Ctrl+C to stop the connection\n\n")
 
 		// 5. Set up port forwarding using SSM with keep alive
@@ -363,8 +419,22 @@ func init() {
 	connectCmd.Flags().Duration("keep-alive-interval", 30*time.Second, "Interval between keep alive checks")
 }
 
+// awsSession holds the result of SSO authentication
+type awsSession struct {
+	Config      aws.Config
+	AccountID   string
+	AccountName string
+	RoleName    string
+	Username    string // email from STS GetCallerIdentity (e.g. dan.williams@lottie.org)
+}
+
+// isKubernetesAccount returns true if the account name indicates a kubernetes account
+func (s *awsSession) isKubernetesAccount() bool {
+	return strings.Contains(strings.ToLower(s.AccountName), "kubernetes")
+}
+
 // Check and load AWS credentials using SSO profile
-func getAWSConfig(ssoProfileName, region, accountId, roleName string) (aws.Config, string, string, error) {
+func getAWSConfig(ssoProfileName, region, accountId, roleName string) (*awsSession, error) {
 	ctx := context.Background()
 	cfgManager := config.NewManager()
 	prompt := ui.NewPrompt()
@@ -372,7 +442,7 @@ func getAWSConfig(ssoProfileName, region, accountId, roleName string) (aws.Confi
 	// Get SSO profile
 	ssoProfile, err := cfgManager.GetSSOProfile(ssoProfileName)
 	if err != nil {
-		return aws.Config{}, "", "", fmt.Errorf("failed to get SSO profile '%s': %v", ssoProfileName, err)
+		return nil, fmt.Errorf("failed to get SSO profile '%s': %v", ssoProfileName, err)
 	}
 
 	// Initialize SSO client
@@ -381,35 +451,44 @@ func getAWSConfig(ssoProfileName, region, accountId, roleName string) (aws.Confi
 	// Authenticate and get token
 	token, err := ssoClient.Authenticate(ctx)
 	if err != nil {
-		return aws.Config{}, "", "", fmt.Errorf("authentication failed: %v", err)
+		return nil, fmt.Errorf("authentication failed: %v", err)
 	}
 
-	// List accounts if account ID not provided
-	if accountId == "" {
-		accounts, err := ssoClient.ListAccounts(ctx, token)
-		if err != nil {
-			return aws.Config{}, "", "", fmt.Errorf("failed to list accounts: %v", err)
-		}
+	// Always list accounts so we can get the account name
+	accounts, err := ssoClient.ListAccounts(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list accounts: %v", err)
+	}
 
-		// Select account
+	var accountName string
+	if accountId == "" {
+		// Select account interactively
 		_, accountId, err = prompt.SelectAccount(accounts)
 		if err != nil {
-			return aws.Config{}, "", "", fmt.Errorf("failed to select account: %v", err)
+			return nil, fmt.Errorf("failed to select account: %v", err)
 		}
 	}
-	fmt.Printf("🪪 Account ID: %s\n", accountId)
+
+	// Find account name from the list
+	for _, acc := range accounts.AccountList {
+		if *acc.AccountId == accountId {
+			accountName = *acc.AccountName
+			break
+		}
+	}
+	fmt.Printf("🪪 Account: %s (%s)\n", accountName, accountId)
 
 	// List roles if role name not provided
 	if roleName == "" {
 		roles, err := ssoClient.ListAccountRoles(ctx, token, accountId)
 		if err != nil {
-			return aws.Config{}, "", "", fmt.Errorf("failed to list roles: %v", err)
+			return nil, fmt.Errorf("failed to list roles: %v", err)
 		}
 
 		// Select role
 		roleName, err = prompt.SelectRole(roles)
 		if err != nil {
-			return aws.Config{}, "", "", fmt.Errorf("failed to select role: %v", err)
+			return nil, fmt.Errorf("failed to select role: %v", err)
 		}
 	}
 	fmt.Printf("👤 Role: %s\n", roleName)
@@ -417,7 +496,7 @@ func getAWSConfig(ssoProfileName, region, accountId, roleName string) (aws.Confi
 	// Get role credentials
 	roleCreds, err := ssoClient.GetRoleCredentials(ctx, token, accountId, roleName)
 	if err != nil {
-		return aws.Config{}, "", "", fmt.Errorf("failed to get role credentials: %v", err)
+		return nil, fmt.Errorf("failed to get role credentials: %v", err)
 	}
 
 	// Create AWS config with the role credentials and region
@@ -430,10 +509,45 @@ func getAWSConfig(ssoProfileName, region, accountId, roleName string) (aws.Confi
 		)),
 	)
 	if err != nil {
-		return aws.Config{}, "", "", fmt.Errorf("failed to create AWS config: %v", err)
+		return nil, fmt.Errorf("failed to create AWS config: %v", err)
 	}
 
-	return awsCfg, accountId, roleName, nil
+	// Get username from STS GetCallerIdentity
+	// ARN format: arn:aws:sts::ACCOUNT:assumed-role/ROLE/username@domain.com
+	var username string
+	stsSvc := sts.NewFromConfig(awsCfg)
+	identity, err := stsSvc.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err == nil && identity.Arn != nil {
+		parts := strings.Split(*identity.Arn, "/")
+		if len(parts) >= 3 {
+			username = parts[len(parts)-1]
+		}
+	}
+
+	return &awsSession{
+		Config:      awsCfg,
+		AccountID:   accountId,
+		AccountName: accountName,
+		RoleName:    roleName,
+		Username:    username,
+	}, nil
+}
+
+// isBastionConnected checks if a bastion instance is reachable via SSM
+func isBastionConnected(cfg aws.Config, instanceID string) bool {
+	ssmSvc := ssm.NewFromConfig(cfg)
+	result, err := ssmSvc.DescribeInstanceInformation(context.Background(), &ssm.DescribeInstanceInformationInput{
+		Filters: []types.InstanceInformationStringFilter{
+			{
+				Key:    aws.String("InstanceIds"),
+				Values: []string{instanceID},
+			},
+		},
+	})
+	if err != nil || len(result.InstanceInformationList) == 0 {
+		return false
+	}
+	return result.InstanceInformationList[0].PingStatus == types.PingStatusOnline
 }
 
 // List all SSM managed instances that can be used as bastion hosts
