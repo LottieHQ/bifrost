@@ -172,8 +172,6 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 			os.Exit(1)
 		}
 		awsCfg := session.Config
-		accountIdFlag = session.AccountID
-		roleNameFlag = session.RoleName
 
 		if serviceTypeFlag == "" {
 			result, err := prompt.Select("Select service type", []string{"rds", "redis"})
@@ -583,7 +581,7 @@ func getAWSConfig(ssoProfileName, region, accountId, roleName string) (*awsSessi
 		if err != nil {
 			return nil, fmt.Errorf("failed to get SSO profile '%s': %v", ssoProfileName, err)
 		}
-		ssoRegion = ssoRegion
+		ssoRegion = ssoProfile.SSORegion
 		startURL = ssoProfile.StartURL
 	} else {
 		ssoRegion = "us-east-1"
@@ -981,67 +979,3 @@ func isPortInUse(port int) bool {
 	return false
 }
 
-// offerToSaveProfile prompts the user to save the manual connection configuration as a profile
-func offerToSaveProfile(cfgManager *config.Manager, prompt *ui.Prompt, ssoProfile, accountID, roleName, region, serviceType, port, bastionInstanceID, rdsInstanceName, redisClusterName string) {
-	fmt.Println() // Add some spacing
-
-	// Ask if they want to save the configuration
-	confirmed, err := prompt.Confirm("Would you like to save this configuration as a connection profile for future use?")
-	if err != nil || !confirmed {
-		return
-	}
-
-	// Prompt for profile name
-	defaultName := serviceType
-	if rdsInstanceName != "" {
-		defaultName = rdsInstanceName
-	} else if redisClusterName != "" {
-		defaultName = redisClusterName
-	}
-	profileName, err := prompt.Input("Profile name", nil, defaultName)
-	if err != nil {
-		fmt.Printf("Error getting profile name: %v\n", err)
-		return
-	}
-
-	// Ask where to save (local vs global)
-	saveLocation, err := prompt.Select("Where would you like to save this profile?", []string{"📁 Local (.bifrost.config.yaml)", "🌍 Global (~/.bifrost/config.yaml)"})
-	if err != nil {
-		fmt.Printf("Error selecting save location: %v\n", err)
-		return
-	}
-
-	// Create connection profile
-	connectionProfile := config.ConnectionProfile{
-		SSOProfile:        ssoProfile,
-		AccountID:         accountID,
-		RoleName:          roleName,
-		Region:            region,
-		ServiceType:       serviceType,
-		Port:              port,
-		BastionInstanceID: bastionInstanceID,
-		RDSInstanceName:   rdsInstanceName,
-		RedisClusterName:  redisClusterName,
-	}
-
-	// Save the profile
-	var saveErr error
-	if saveLocation == "🌍 Global (~/.bifrost/config.yaml)" {
-		saveErr = cfgManager.AddConnectionProfile(profileName, connectionProfile)
-		if saveErr == nil {
-			fmt.Printf("✅ Connection profile '%s' saved to global config\n", profileName)
-		}
-	} else {
-		saveErr = cfgManager.AddLocalConnectionProfile(profileName, connectionProfile)
-		if saveErr == nil {
-			fmt.Printf("✅ Connection profile '%s' saved to local config (.bifrost.config.yaml)\n", profileName)
-		}
-	}
-
-	if saveErr != nil {
-		fmt.Printf("❌ Error saving profile: %v\n", saveErr)
-		return
-	}
-
-	fmt.Printf("💡 You can now use this profile with: bifrost connect --profile %s\n", profileName)
-}

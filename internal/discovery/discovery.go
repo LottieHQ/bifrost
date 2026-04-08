@@ -100,7 +100,7 @@ func discoverAccount(
 	ig.Go(func() error {
 		r, err := discoverRedis(ictx, cfg, accountID, accountName, roleName, region)
 		if err != nil {
-			return fmt.Errorf("Redis discovery failed for %s: %w", accountName, err)
+			return fmt.Errorf("redis discovery failed for %s: %w", accountName, err)
 		}
 		redisResources = r
 		return nil
