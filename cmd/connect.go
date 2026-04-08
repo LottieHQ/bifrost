@@ -75,46 +75,23 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 			return
 		}
 
-		// --- Resolve SSO profile ---
-		if ssoProfileFlag == "" {
-			defaultProfile, err := cfgManager.GetDefaultSSOProfile()
+		// --- SSO authenticate (for discovery + later use) ---
+		var ssoRegion string
+		var ssoClient *sso.Client
+		if ssoProfileFlag != "" {
+			// Explicit profile override
+			profile, err := cfgManager.GetSSOProfile(ssoProfileFlag)
 			if err != nil {
-				fmt.Printf("Error loading config: %v\n", err)
+				fmt.Printf("Error: %v\n", err)
 				os.Exit(1)
 			}
-			if defaultProfile != "" {
-				ssoProfileFlag = defaultProfile
-				fmt.Printf("🔐 Using SSO profile: %s\n", ssoProfileFlag)
-			} else {
-				cfg, err := cfgManager.Load()
-				if err != nil {
-					fmt.Printf("Error loading config: %v\n", err)
-					os.Exit(1)
-				}
-				if len(cfg.SSOProfiles) == 0 {
-					fmt.Println("No SSO profiles found. Please create one with 'bifrost auth configure'")
-					os.Exit(1)
-				}
-				profileNames := make([]string, 0, len(cfg.SSOProfiles))
-				for name := range cfg.SSOProfiles {
-					profileNames = append(profileNames, name)
-				}
-				selected, err := prompt.Select("Select SSO profile", profileNames)
-				if err != nil {
-					fmt.Printf("Error selecting profile: %v\n", err)
-					os.Exit(1)
-				}
-				ssoProfileFlag = selected
-			}
+			ssoRegion = profile.SSORegion
+			ssoClient = sso.NewClient(profile.SSORegion, profile.StartURL)
+		} else {
+			// Default Lottie SSO endpoint
+			ssoRegion = "us-east-1"
+			ssoClient = sso.NewClient(ssoRegion, "https://d-906785ee68.awsapps.com/start")
 		}
-
-		// --- SSO authenticate (for discovery + later use) ---
-		ssoProfile, err := cfgManager.GetSSOProfile(ssoProfileFlag)
-		if err != nil {
-			fmt.Printf("Error: %v\n", err)
-			os.Exit(1)
-		}
-		ssoClient := sso.NewClient(ssoProfile.SSORegion, ssoProfile.StartURL)
 		ctx := context.Background()
 		token, err := ssoClient.Authenticate(ctx)
 		if err != nil {
@@ -141,7 +118,7 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 			}
 			if resources == nil {
 				fmt.Println("🔍 Discovering resources...")
-				resources, err = discovery.Discover(ctx, ssoProfile.SSORegion, token, accounts.AccountList, regionFlag)
+				resources, err = discovery.Discover(ctx, ssoRegion, token, accounts.AccountList, regionFlag)
 				if err != nil {
 					fmt.Printf("Warning: discovery failed: %v\n", err)
 				}
@@ -180,7 +157,7 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 
 				// Handle discovered resource selection
 				if selected != nil {
-					runDiscoveredConnect(selected, ssoProfile.SSORegion, token, prompt, regionFlag, keepAliveFlag, keepAliveInterval)
+					runDiscoveredConnect(selected, ssoRegion, token, prompt, regionFlag, keepAliveFlag, keepAliveInterval)
 					return
 				}
 
@@ -189,7 +166,7 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 		}
 
 		// --- Manual flow (existing behavior) ---
-		session, err := getAWSConfigWithToken(ssoProfileFlag, ssoProfile.SSORegion, token, regionFlag, accountIdFlag, roleNameFlag, prompt)
+		session, err := getAWSConfigWithToken(ssoProfileFlag, ssoRegion, token, regionFlag, accountIdFlag, roleNameFlag, prompt)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
@@ -580,18 +557,26 @@ func getAWSConfig(ssoProfileName, region, accountId, roleName string) (*awsSessi
 	cfgManager := config.NewManager()
 	prompt := ui.NewPrompt()
 
-	ssoProfile, err := cfgManager.GetSSOProfile(ssoProfileName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get SSO profile '%s': %v", ssoProfileName, err)
+	var ssoRegion, startURL string
+	if ssoProfileName != "" {
+		ssoProfile, err := cfgManager.GetSSOProfile(ssoProfileName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get SSO profile '%s': %v", ssoProfileName, err)
+		}
+		ssoRegion = ssoRegion
+		startURL = ssoProfile.StartURL
+	} else {
+		ssoRegion = "us-east-1"
+		startURL = "https://d-906785ee68.awsapps.com/start"
 	}
 
-	ssoClient := sso.NewClient(ssoProfile.SSORegion, ssoProfile.StartURL)
+	ssoClient := sso.NewClient(ssoRegion, startURL)
 	token, err := ssoClient.Authenticate(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("authentication failed: %v", err)
 	}
 
-	return getAWSConfigWithToken(ssoProfileName, ssoProfile.SSORegion, token, region, accountId, roleName, prompt)
+	return getAWSConfigWithToken(ssoProfileName, ssoRegion, token, region, accountId, roleName, prompt)
 }
 
 // getUsernameFromSTS extracts the username from the STS caller identity ARN.
