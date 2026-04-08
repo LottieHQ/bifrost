@@ -5,12 +5,13 @@ A command-line utility to simplify connecting to AWS RDS/Redis instances through
 
 ## Features
 
-- **Interactive Resource Discovery**: Browse and select from available AWS resources (RDS instances, Redis clusters, SSM-managed bastion hosts)
-- **Direct Resource Access**: Connect to specific resources by name/ID when you know exactly what you want
-- **SSO Integration**: Seamless AWS SSO authentication with token caching
-- **Connection Profiles**: Save and reuse connection configurations (local or global)
-- **Keep Alive**: Maintains stable connections with periodic health checks (like TablePlus)
-- **Smart Filtering**: Only shows usable resources (SSM-managed instances, reachable databases)
+- **Auto-Discovery**: Discovers all RDS and Redis resources across your AWS accounts in parallel
+- **IAM Database Auth**: Generates IAM auth tokens for RDS clusters with one-click `psql` command
+- **Admin Escalation**: Connect as `su-` superuser for database admin tasks
+- **SSO Integration**: Uses the Lottie SSO portal automatically — no configuration needed
+- **Connection Profiles**: Save and reuse connection configurations for resources discovery doesn't cover
+- **Keep Alive**: Maintains stable connections with periodic health checks
+- **Smart Bastion Selection**: Auto-discovers and selects SSM-managed bastion hosts
 
 ## Installation
 
@@ -24,65 +25,65 @@ brew install bifrost
 
 ## Quick Start
 
-### 1. Configure SSO Profile
-```bash
-# Set up your AWS SSO profile
-bifrost auth configure --profile work
+No configuration needed. Just run:
 
-# Login with SSO
-bifrost auth login --profile work
-```
-
-### 2. Connect to Database
 ```bash
-# Interactive mode with resource discovery (recommended)
 bifrost connect
-# Choose "Manual setup", then leave resource fields empty to browse available options
-
-# Using a saved profile
-bifrost connect --profile dev-rds
-
-# Direct connection when you know the resource names
-bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcdef0
-
-# With custom keep alive interval
-bifrost connect --profile dev-redis --keep-alive-interval 60s
-
-# Disable keep alive
-bifrost connect --profile dev-rds --keep-alive=false
 ```
 
-#### 🔍 Resource Discovery
-When using interactive mode, you can leave any resource field empty to browse available options:
-- **Bastion Hosts**: Shows SSM-managed EC2 instances with names like "bastion-prod (i-1234567890abcdef0)"
-- **RDS Instances**: Lists all RDS database instances in the selected region
-- **Redis Clusters**: Shows all ElastiCache Redis clusters in the selected region
+Bifrost will:
+1. Authenticate via SSO (opens browser on first run, then caches the token)
+2. Discover all RDS clusters and Redis instances across your accounts
+3. Present a menu to select a resource
+4. Auto-discover and select a bastion host
+5. For IAM-enabled databases: prompt for auth method and generate a token
+6. Start the SSM tunnel and copy the `psql` command to your clipboard
 
-### 3. Manage Profiles
+### IAM Authentication
+
+Databases tagged with `bifrost:iam-auth` offer three auth methods:
+
+- **IAM** — connects as your SSO identity (e.g. `dan.williams@lottie.org`)
+- **IAM Admin** — connects as superuser (e.g. `su-dan.williams@lottie.org`), requires `infra-aws-database-admins` Google group membership
+- **Password** — manual password entry
+
+### Other Options
+
 ```bash
-# Create a connection profile (resource names optional)
-bifrost profile create --name staging-db --service rds
-# Leave bastion/RDS/Redis fields empty during creation to browse during connection
+# Use a saved connection profile
+bifrost connect --profile staging-db
 
-# Create with specific resource names
-bifrost profile create --name staging-db --service rds --bastion-id i-1234567890abcdef0
+# Force re-discovery (ignores 1-hour cache)
+bifrost connect --refresh
+
+# Manual setup (bypass discovery)
+bifrost connect --account-id 904233092296 --service rds
+
+# Custom keep alive interval
+bifrost connect --keep-alive-interval 60s
+```
+
+### Managing Profiles
+
+Saved profiles are useful for resources that discovery doesn't cover, or for pinning specific connection settings.
+
+```bash
+# Create a connection profile
+bifrost profile create --name staging-db --service rds
 
 # List profiles
 bifrost profile list
-
-# Help
-bifrost help
 ```
 
 ## How It Works
 
-**Keep Alive**: Bifrost automatically sends lightweight health checks to your database connections (Redis `PING`, RDS `SELECT 1`) every 30 seconds by default. This prevents timeout disconnections, similar to how TablePlus maintains stable connections.
+**Discovery**: On first run, Bifrost scans all AWS accounts you have access to (via SSO) and discovers RDS clusters, Redis replication groups, and SSM-managed bastion hosts. Results are cached for 1 hour at `~/.bifrost/discovery-cache-*.json`. Use `--refresh` to force a re-scan.
 
-**Interactive Discovery**: When resource fields are left empty, Bifrost automatically discovers available options using AWS APIs. Only shows usable resources (SSM-managed instances for bastions, reachable databases).
+**IAM Auth**: For RDS clusters tagged with `bifrost:iam-auth=true`, Bifrost generates a 15-minute IAM auth token using your SSO credentials. The full `psql` connection command is copied to your clipboard.
 
-**Flexible Resource Access**: Choose between browsing available resources interactively or specifying exact names/IDs when you know them. Profiles can store specific resource names or leave them empty for discovery during connection.
+**Keep Alive**: Bifrost sends periodic TCP health checks (every 30 seconds by default) to prevent SSM session timeouts.
 
-**Profile System**: Save connection settings locally (`.bifrost.config.yaml`) or globally (`~/.bifrost/config.yaml`). SSO profiles are always global, connection profiles can be either. Profiles can include bastion instance IDs for direct connections.
+**Bastion Selection**: If a single SSM-managed instance exists in the target account, it's auto-selected. If multiple exist, you're prompted to choose.
 ## Updating
 ### Using Homebrew
 
@@ -101,14 +102,13 @@ To update bifrost to the latest version:
 
 ## Upcoming features
 
-- [ ] Optional tag-based resource discovery
 - [ ] Multiple simultaneous connections
-- [ ] Terminal UI (TUI) interface
+- [ ] Token refresh without reconnecting
 
 ## Developing
 ### Requirements
 
-- Go 1.24
+- Go 1.24+
 - AWS CLI [brew install awscli](https://formulae.brew.sh/formula/awscli) or [official docs](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
 - AWS CLI SSM plugin [brew install --cask session-manager-plugin](https://formulae.brew.sh/cask/session-manager-plugin#default) or [official docs](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
 

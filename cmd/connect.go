@@ -14,17 +14,23 @@ import (
 	"syscall"
 	"time"
 
+	"strings"
+
+	"github.com/atotto/clipboard"
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/rds/auth"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/elasticache"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/aws-sdk-go-v2/service/ssm/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/LottieHQ/bifrost/internal/config"
+	"github.com/LottieHQ/bifrost/internal/discovery"
 	"github.com/LottieHQ/bifrost/internal/sso"
 	"github.com/LottieHQ/bifrost/internal/ui"
+	ssosdk "github.com/aws/aws-sdk-go-v2/service/sso"
+	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
 	"github.com/spf13/cobra"
 )
 
@@ -50,136 +56,122 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 		bastionInstanceIDFlag, _ := cmd.Flags().GetString("bastion-instance-id")
 		keepAliveFlag, _ := cmd.Flags().GetBool("keep-alive")
 		keepAliveInterval, _ := cmd.Flags().GetDuration("keep-alive-interval")
+		refreshFlag, _ := cmd.Flags().GetBool("refresh")
 
-		// Check if using connection profile (from flag or selection)
-		var selectedProfile *config.ConnectionProfile
+		// Default region to eu-west-2 if not provided
+		if regionFlag == "" {
+			regionFlag = "eu-west-2"
+		}
+
+		// --- Profile flag: use existing profile flow directly ---
 		if profileFlag != "" {
-			// Load specific connection profile
 			profile, err := cfgManager.GetConnectionProfile(profileFlag)
 			if err != nil {
 				fmt.Printf("Error loading connection profile '%s': %v\n", profileFlag, err)
 				os.Exit(1)
 			}
-			selectedProfile = profile
 			fmt.Printf("🔗 Using connection profile: %s\n", profileFlag)
-		} else {
-			// Check for available connection profiles and offer selection
-			cfg, err := cfgManager.Load()
-			if err != nil {
-				fmt.Printf("Error loading config: %v\n", err)
-				os.Exit(1)
-			}
-
-			if len(cfg.ConnectionProfiles) > 0 {
-				// Add manual setup option with clear distinction
-				profileNames := make([]string, 0, len(cfg.ConnectionProfiles)+1)
-				profileNames = append(profileNames, "⚙️ Manual setup")
-				for name := range cfg.ConnectionProfiles {
-					profileNames = append(profileNames, "🔗 "+name)
-				}
-
-				selected, err := prompt.Select("Select connection profile or manual setup", profileNames)
-				if err != nil {
-					fmt.Printf("Error selecting profile: %v\n", err)
-					os.Exit(1)
-				}
-
-				if selected != "⚙️ Manual setup" {
-					// Remove the emoji prefix to get actual profile name
-					profileName := selected[5:] // Remove "🔗 " prefix
-					profile, err := cfgManager.GetConnectionProfile(profileName)
-					if err != nil {
-						fmt.Printf("Error loading connection profile '%s': %v\n", profileName, err)
-						os.Exit(1)
-					}
-					selectedProfile = profile
-					fmt.Printf("🔗 Using connection profile: %s\n", profileName)
-				}
-			}
+			runProfileConnect(cmd, profile, prompt, cfgManager, regionFlag, keepAliveFlag, keepAliveInterval)
+			return
 		}
 
-		// Use connection profile values as defaults (if available)
-		if selectedProfile != nil {
-			if ssoProfileFlag == "" && selectedProfile.SSOProfile != "" {
-				ssoProfileFlag = selectedProfile.SSOProfile
-			}
-			if accountIdFlag == "" && selectedProfile.AccountID != "" {
-				accountIdFlag = selectedProfile.AccountID
-			}
-			if roleNameFlag == "" && selectedProfile.RoleName != "" {
-				roleNameFlag = selectedProfile.RoleName
-			}
-			if regionFlag == "" && selectedProfile.Region != "" {
-				regionFlag = selectedProfile.Region
-			}
-			if serviceTypeFlag == "" && selectedProfile.ServiceType != "" {
-				serviceTypeFlag = selectedProfile.ServiceType
-			}
-			if portFlag == "" && selectedProfile.Port != "" {
-				portFlag = selectedProfile.Port
-			}
-			if bastionInstanceIDFlag == "" && selectedProfile.BastionInstanceID != "" {
-				bastionInstanceIDFlag = selectedProfile.BastionInstanceID
-			}
-		}
-
-		// Prompt for SSO profile if not provided
-		if ssoProfileFlag == "" {
-			// Try to get default SSO profile (if only one exists)
-			defaultProfile, err := cfgManager.GetDefaultSSOProfile()
-			if err != nil {
-				fmt.Printf("Error loading config: %v\n", err)
-				os.Exit(1)
-			}
-
-			if defaultProfile != "" {
-				ssoProfileFlag = defaultProfile
-				fmt.Printf("🔐 Using SSO profile: %s\n", ssoProfileFlag)
-			} else {
-				// Load config to show available profiles
-				cfg, err := cfgManager.Load()
-				if err != nil {
-					fmt.Printf("Error loading config: %v\n", err)
-					os.Exit(1)
-				}
-
-				if len(cfg.SSOProfiles) == 0 {
-					fmt.Println("No SSO profiles found. Please create one with 'bifrost auth configure'")
-					os.Exit(1)
-				}
-
-				profileNames := make([]string, 0, len(cfg.SSOProfiles))
-				for name := range cfg.SSOProfiles {
-					profileNames = append(profileNames, name)
-				}
-
-				selected, err := prompt.Select("Select SSO profile", profileNames)
-				if err != nil {
-					fmt.Printf("Error selecting profile: %v\n", err)
-					os.Exit(1)
-				}
-				ssoProfileFlag = selected
-			}
-		}
-
-		// Prompt for region if not provided
-		if regionFlag == "" {
-			result, err := prompt.Input("AWS region (where your RDS/Redis instances are)", nil)
+		// --- SSO authenticate (for discovery + later use) ---
+		var ssoRegion string
+		var ssoClient *sso.Client
+		if ssoProfileFlag != "" {
+			// Explicit profile override
+			profile, err := cfgManager.GetSSOProfile(ssoProfileFlag)
 			if err != nil {
 				fmt.Printf("Error: %v\n", err)
 				os.Exit(1)
 			}
-			regionFlag = result
+			ssoRegion = profile.SSORegion
+			ssoClient = sso.NewClient(profile.SSORegion, profile.StartURL)
+		} else {
+			// Default Lottie SSO endpoint
+			ssoRegion = "us-east-1"
+			ssoClient = sso.NewClient(ssoRegion, "https://d-906785ee68.awsapps.com/start")
+		}
+		ctx := context.Background()
+		token, err := ssoClient.Authenticate(ctx)
+		if err != nil {
+			fmt.Printf("Authentication failed: %v\n", err)
+			os.Exit(1)
 		}
 
-		// 1. Check AWS credentials
-		awsCfg, accountIdFlag, roleNameFlag, err := getAWSConfig(ssoProfileFlag, regionFlag, accountIdFlag, roleNameFlag)
+		// --- Discovery flow (unless manual flags are set) ---
+		manualMode := accountIdFlag != "" || serviceTypeFlag != "" // user passed manual flags
+		if !manualMode {
+			accounts, err := ssoClient.ListAccounts(ctx, token)
+			if err != nil {
+				fmt.Printf("Error listing accounts: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Load or refresh discovery cache
+			var resources []discovery.Resource
+			if !refreshFlag {
+				cache, _ := discovery.LoadCache(ssoProfileFlag)
+				if discovery.IsCacheValid(cache) {
+					resources = cache.Resources
+				}
+			}
+			if resources == nil {
+				fmt.Println("🔍 Discovering resources...")
+				resources, err = discovery.Discover(ctx, ssoRegion, token, accounts.AccountList, regionFlag)
+				if err != nil {
+					fmt.Printf("Warning: discovery failed: %v\n", err)
+				}
+				if len(resources) > 0 {
+					_ = discovery.SaveCache(ssoProfileFlag, resources)
+				}
+			}
+
+			if len(resources) > 0 {
+				// Get saved connection profile names
+				cfg, _ := cfgManager.Load()
+				var profileNames []string
+				if cfg != nil {
+					for name := range cfg.ConnectionProfiles {
+						profileNames = append(profileNames, name)
+					}
+				}
+
+				selected, selectedProfileName, err := prompt.SelectResource(resources, profileNames)
+				if err != nil {
+					fmt.Printf("Error: %v\n", err)
+					os.Exit(1)
+				}
+
+				// Handle saved profile selection
+				if selectedProfileName != "" {
+					profile, err := cfgManager.GetConnectionProfile(selectedProfileName)
+					if err != nil {
+						fmt.Printf("Error loading profile '%s': %v\n", selectedProfileName, err)
+						os.Exit(1)
+					}
+					fmt.Printf("🔗 Using connection profile: %s\n", selectedProfileName)
+					runProfileConnect(cmd, profile, prompt, cfgManager, regionFlag, keepAliveFlag, keepAliveInterval)
+					return
+				}
+
+				// Handle discovered resource selection
+				if selected != nil {
+					runDiscoveredConnect(selected, ssoRegion, token, prompt, regionFlag, keepAliveFlag, keepAliveInterval)
+					return
+				}
+
+				// Manual setup selected — fall through
+			}
+		}
+
+		// --- Manual flow (existing behavior) ---
+		session, err := getAWSConfigWithToken(ssoProfileFlag, ssoRegion, token, regionFlag, accountIdFlag, roleNameFlag, prompt)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
-
-		// Check service type
+		awsCfg := session.Config
 
 		if serviceTypeFlag == "" {
 			result, err := prompt.Select("Select service type", []string{"rds", "redis"})
@@ -195,7 +187,11 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 		fmt.Printf("🛠️ Service type: %s\n", serviceTypeFlag)
 
 		if portFlag == "" {
-			result, err := prompt.Input("Enter local port to use for forwarding", validatePort)
+			defaultPort := "5432"
+			if serviceTypeFlag == "redis" {
+				defaultPort = "6379"
+			}
+			result, err := prompt.Input("Enter local port to use for forwarding", validatePort, defaultPort)
 			if err != nil {
 				fmt.Printf("Prompt failed %v\n", err)
 				return
@@ -207,144 +203,34 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 		}
 		fmt.Printf("🌐 Port: %s\n", portFlag)
 
-		// 2. Prompt for bastion instance ID if not provided
-		if bastionInstanceIDFlag == "" {
-			result, err := prompt.Input("Enter bastion EC2 instance ID (or leave empty to browse)", nil)
-			if err != nil {
-				fmt.Printf("Error: %v\n", err)
-				os.Exit(1)
-			}
+		bastionInstanceIDFlag = resolveBastionID(awsCfg, bastionInstanceIDFlag, prompt)
 
-			// If user left it empty, show available SSM managed instances
-			if result == "" {
-				instances, instanceMap, err := listSSMManagedInstances(awsCfg)
-				if err != nil {
-					fmt.Printf("Error listing SSM managed instances: %v\n", err)
-					os.Exit(1)
-				}
-
-				if len(instances) == 0 {
-					fmt.Println("No SSM managed instances found in this region.")
-					os.Exit(1)
-				}
-
-				selected, err := prompt.Select("Select bastion instance", instances)
-				if err != nil {
-					fmt.Printf("Error selecting bastion instance: %v\n", err)
-					os.Exit(1)
-				}
-				bastionInstanceIDFlag = instanceMap[selected]
-			} else {
-				bastionInstanceIDFlag = result
-			}
-		}
-		fmt.Printf("🏰 Using bastion instance: %s\n", bastionInstanceIDFlag)
-
-		// Get endpoint based on service type
 		var endpoint string
 		var port int32
-		var clusterName, dbName string
 		if serviceTypeFlag == "redis" {
-			// Use Redis cluster name from profile or prompt for it
-			if selectedProfile != nil && selectedProfile.RedisClusterName != "" {
-				clusterName = selectedProfile.RedisClusterName
-				fmt.Printf("🔗 Using Redis cluster from profile: %s\n", clusterName)
-			} else {
-				var err error
-				clusterName, err = prompt.Input("Enter Redis cluster name (or leave empty to browse)", nil)
-				if err != nil {
-					fmt.Printf("Error: %v\n", err)
-					os.Exit(1)
-				}
-
-				// If user left it empty, show available clusters
-				if clusterName == "" {
-					clusters, err := listRedisClusters(awsCfg)
-					if err != nil {
-						fmt.Printf("Error listing Redis clusters: %v\n", err)
-						os.Exit(1)
-					}
-
-					if len(clusters) == 0 {
-						fmt.Println("No Redis clusters found in this region.")
-						os.Exit(1)
-					}
-
-					clusterName, err = prompt.Select("Select Redis cluster", clusters)
-					if err != nil {
-						fmt.Printf("Error selecting Redis cluster: %v\n", err)
-						os.Exit(1)
-					}
-				}
+			var clusterName string
+			clusterName, err = promptForRedis(awsCfg, prompt)
+			if err == nil {
+				endpoint, port, err = getRedisEndpoint(awsCfg, clusterName)
 			}
-			endpoint, port, err = getRedisEndpoint(awsCfg, clusterName)
-		}
-		if serviceTypeFlag == "rds" {
-			// Use RDS instance name from profile or prompt for it
-			if selectedProfile != nil && selectedProfile.RDSInstanceName != "" {
-				dbName = selectedProfile.RDSInstanceName
-				fmt.Printf("🔗 Using RDS instance from profile: %s\n", dbName)
-			} else {
-				var err error
-				dbName, err = prompt.Input("Enter RDS DB instance name (or leave empty to browse)", nil)
-				if err != nil {
-					fmt.Printf("Error: %v\n", err)
-					os.Exit(1)
-				}
-
-				// If user left it empty, show available instances
-				if dbName == "" {
-					instances, err := listRDSInstances(awsCfg)
-					if err != nil {
-						fmt.Printf("Error listing RDS instances: %v\n", err)
-						os.Exit(1)
-					}
-
-					if len(instances) == 0 {
-						fmt.Println("No RDS instances found in this region.")
-						os.Exit(1)
-					}
-
-					dbName, err = prompt.Select("Select RDS instance", instances)
-					if err != nil {
-						fmt.Printf("Error selecting RDS instance: %v\n", err)
-						os.Exit(1)
-					}
-				}
+		} else {
+			var dbName string
+			dbName, err = promptForRDS(awsCfg, prompt)
+			if err == nil {
+				endpoint, port, err = getRDSEndpoint(awsCfg, dbName)
 			}
-			endpoint, port, err = getRDSEndpoint(awsCfg, dbName)
 		}
-
 		if err != nil {
-			fmt.Printf("Error retrieving endpoint: %v\n", err)
+			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
 
-		// 4. Offer to save as profile if manual setup was used (before starting SSM session)
-		if selectedProfile == nil { // Only for manual setup
-			// Get the actual resource names that were used
-			var rdsName, redisName string
-			if serviceTypeFlag == "redis" {
-				redisName = clusterName
-			} else {
-				rdsName = dbName
-			}
-			offerToSaveProfile(cfgManager, prompt, ssoProfileFlag, accountIdFlag, roleNameFlag, regionFlag, serviceTypeFlag, portFlag, bastionInstanceIDFlag, rdsName, redisName)
+		var iamAuthUser string
+		if serviceTypeFlag == "rds" && session.isKubernetesAccount() && session.Username != "" {
+			iamAuthUser = promptForAuthMethod(session.Username, prompt)
 		}
 
-		fmt.Printf("🔌 Forwarding `%s` to 127.0.0.1:%s (use this as host in your app or client)\n", serviceTypeFlag, portFlag)
-		fmt.Printf("📝 Press Ctrl+C to stop the connection\n\n")
-
-		// 5. Set up port forwarding using SSM with keep alive
-		if keepAliveFlag {
-			fmt.Printf("💓 Keep alive enabled (interval: %v)\n", keepAliveInterval)
-		}
-		err = startSSMPortForwardingWithKeepAlive(awsCfg, bastionInstanceIDFlag, endpoint, port, portFlag, regionFlag, keepAliveFlag, keepAliveInterval)
-		if err != nil {
-			fmt.Printf("Error starting SSM session: %v\n", err)
-			os.Exit(1)
-		}
-
+		runConnection(awsCfg, endpoint, port, portFlag, bastionInstanceIDFlag, regionFlag, iamAuthUser, keepAliveFlag, keepAliveInterval)
 	},
 }
 
@@ -361,79 +247,386 @@ func init() {
 	connectCmd.Flags().String("bastion-instance-id", "", "EC2 instance ID of bastion host (required)")
 	connectCmd.Flags().Bool("keep-alive", true, "Enable keep alive to maintain SSM connection")
 	connectCmd.Flags().Duration("keep-alive-interval", 30*time.Second, "Interval between keep alive checks")
+	connectCmd.Flags().Bool("refresh", false, "Force re-discovery of available resources (ignore cache)")
 }
 
-// Check and load AWS credentials using SSO profile
-func getAWSConfig(ssoProfileName, region, accountId, roleName string) (aws.Config, string, string, error) {
+// runDiscoveredConnect handles connection to a discovered resource.
+func runDiscoveredConnect(
+	res *discovery.Resource,
+	ssoRegion string,
+	token *ssooidc.CreateTokenOutput,
+	prompt *ui.Prompt,
+	region string,
+	keepAlive bool,
+	keepAliveInterval time.Duration,
+) {
+	fmt.Printf("🪪 Account: %s\n", res.AccountName)
+	fmt.Printf("🎯 %s: %s (%s)\n", res.ServiceType, res.Name, res.Engine)
+
+	// Get credentials for the resource's account
 	ctx := context.Background()
-	cfgManager := config.NewManager()
-	prompt := ui.NewPrompt()
-
-	// Get SSO profile
-	ssoProfile, err := cfgManager.GetSSOProfile(ssoProfileName)
+	awsCfg, err := discovery.BuildAWSConfig(ctx, ssoRegion, token, res.AccountID, res.RoleName, region)
 	if err != nil {
-		return aws.Config{}, "", "", fmt.Errorf("failed to get SSO profile '%s': %v", ssoProfileName, err)
+		fmt.Printf("Error creating AWS config: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Initialize SSO client
-	ssoClient := sso.NewClient(ssoProfile.SSORegion, ssoProfile.StartURL)
-
-	// Authenticate and get token
-	token, err := ssoClient.Authenticate(ctx)
+	// Prompt for local port with sensible default
+	defaultPort := fmt.Sprintf("%d", res.Port)
+	portFlag, err := prompt.Input("Local port", validatePort, defaultPort)
 	if err != nil {
-		return aws.Config{}, "", "", fmt.Errorf("authentication failed: %v", err)
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
 	}
 
-	// List accounts if account ID not provided
-	if accountId == "" {
-		accounts, err := ssoClient.ListAccounts(ctx, token)
-		if err != nil {
-			return aws.Config{}, "", "", fmt.Errorf("failed to list accounts: %v", err)
+	// Validate bastion
+	bastionID := resolveBastionID(awsCfg, res.BastionID, prompt)
+
+	// IAM auth for tagged RDS resources
+	var iamAuthUser string
+	if res.IAMAuthEnabled && res.ServiceType == "rds" {
+		if username := getUsernameFromSTS(awsCfg); username != "" {
+			iamAuthUser = promptForAuthMethod(username, prompt)
 		}
+	}
 
-		// Select account
+	runConnection(awsCfg, res.Endpoint, res.Port, portFlag, bastionID, region, iamAuthUser, keepAlive, keepAliveInterval)
+}
+
+// runProfileConnect handles connection using a saved profile.
+func runProfileConnect(
+	cmd *cobra.Command,
+	profile *config.ConnectionProfile,
+	prompt *ui.Prompt,
+	cfgManager *config.Manager,
+	regionFlag string,
+	keepAlive bool,
+	keepAliveInterval time.Duration,
+) {
+	ssoProfileFlag := profile.SSOProfile
+	accountIdFlag := profile.AccountID
+	roleNameFlag := profile.RoleName
+	if profile.Region != "" {
+		regionFlag = profile.Region
+	}
+
+	session, err := getAWSConfig(ssoProfileFlag, regionFlag, accountIdFlag, roleNameFlag)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+	awsCfg := session.Config
+
+	serviceType := profile.ServiceType
+	portFlag := profile.Port
+	bastionID := resolveBastionID(awsCfg, profile.BastionInstanceID, prompt)
+
+	var endpoint string
+	var port int32
+	if serviceType == "redis" && profile.RedisClusterName != "" {
+		fmt.Printf("🔗 Using Redis cluster: %s\n", profile.RedisClusterName)
+		endpoint, port, err = getRedisEndpoint(awsCfg, profile.RedisClusterName)
+	} else if profile.RDSInstanceName != "" {
+		fmt.Printf("🔗 Using RDS instance: %s\n", profile.RDSInstanceName)
+		endpoint, port, err = getRDSEndpoint(awsCfg, profile.RDSInstanceName)
+	} else {
+		fmt.Println("Error: profile is missing resource name")
+		os.Exit(1)
+	}
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	var iamAuthUser string
+	if serviceType == "rds" && session.isKubernetesAccount() && session.Username != "" {
+		iamAuthUser = promptForAuthMethod(session.Username, prompt)
+	}
+
+	runConnection(awsCfg, endpoint, port, portFlag, bastionID, regionFlag, iamAuthUser, keepAlive, keepAliveInterval)
+}
+
+// runConnection handles the final connection: IAM token, port forwarding, keep-alive.
+func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort string, bastionID string, region string, iamAuthUser string, keepAlive bool, keepAliveInterval time.Duration) {
+	fmt.Println()
+	fmt.Println("  ┌───────────────────────────────────────────────────────────┐")
+	fmt.Printf("  │  🔌 Tunnel open on localhost:%-29s│\n", localPort)
+	fmt.Println("  │                                                           │")
+	fmt.Println("  │  You can connect with any database client and credentials │")
+	fmt.Println("  │  (psql, TablePlus, DBeaver, etc.) using localhost as the  │")
+	fmt.Println("  │  host and the port above.                                 │")
+	fmt.Println("  └───────────────────────────────────────────────────────────┘")
+	fmt.Println()
+
+	if iamAuthUser != "" {
+		token, err := auth.BuildAuthToken(
+			context.Background(),
+			fmt.Sprintf("%s:%d", endpoint, port),
+			region,
+			iamAuthUser,
+			awsCfg.Credentials,
+		)
+		if err != nil {
+			fmt.Printf("❌ Failed to generate IAM auth token: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("  🔑 IAM token for %s (expires in ~15 min):\n\n", iamAuthUser)
+		psqlCmd := fmt.Sprintf("PGPASSWORD='%s' psql -h localhost -p %s -U '%s' -d postgres", token, localPort, iamAuthUser)
+		fmt.Printf("    %s\n\n", psqlCmd)
+		if err := clipboard.WriteAll(token); err == nil {
+			fmt.Println("  📋 Token copied to clipboard")
+			fmt.Println("  📋 Use as the password in your database client")
+		}
+		fmt.Println()
+	}
+
+	fmt.Printf("📝 Press Ctrl+C to stop the connection\n\n")
+
+	if keepAlive {
+		fmt.Printf("💓 Keep alive enabled (interval: %v)\n", keepAliveInterval)
+	}
+	if err := startSSMPortForwardingWithKeepAlive(awsCfg, bastionID, endpoint, port, localPort, region, keepAlive, keepAliveInterval); err != nil {
+		fmt.Printf("Error starting SSM session: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// promptForAuthMethod asks the user to pick IAM / IAM Admin / Password.
+func promptForAuthMethod(username string, prompt *ui.Prompt) string {
+	authOptions := []string{
+		fmt.Sprintf("🔑 IAM (%s)", username),
+		fmt.Sprintf("🔑 IAM Superuser (su-%s)", username),
+		"🔐 Password (manual)",
+	}
+	authMethod, err := prompt.Select("Authentication method", authOptions)
+	if err != nil {
+		fmt.Printf("Error selecting auth method: %v\n", err)
+		os.Exit(1)
+	}
+	switch {
+	case strings.HasPrefix(authMethod, "🔑 IAM Superuser"):
+		fmt.Println()
+		fmt.Println("  Superuser requires the infra-aws-database-admins Google group.")
+		fmt.Println("  If you are not a member, a token will still be generated but")
+		fmt.Println("  the su- database user won't exist and authentication will fail.")
+		fmt.Println()
+		fmt.Println("  Check membership: https://groups.google.com/a/lottie.org/g/infra-aws-database-admins/members")
+		fmt.Println()
+		confirmed, err := prompt.Confirm("Continue with superuser?")
+		if err != nil || !confirmed {
+			fmt.Println("  Using standard IAM auth instead")
+			return username
+		}
+		return "su-" + username
+	case strings.HasPrefix(authMethod, "🔑 IAM ("):
+		return username
+	}
+	return ""
+}
+
+// resolveBastionID validates a bastion ID or discovers one.
+func resolveBastionID(awsCfg aws.Config, bastionID string, prompt *ui.Prompt) string {
+	if bastionID != "" {
+		if isBastionConnected(awsCfg, bastionID) {
+			fmt.Printf("🏰 Using bastion: %s\n", bastionID)
+			return bastionID
+		}
+		fmt.Printf("⚠️  Bastion %s is not connected, discovering...\n", bastionID)
+	}
+
+	instances, instanceMap, err := listSSMManagedInstances(awsCfg)
+	if err != nil {
+		fmt.Printf("Error listing SSM instances: %v\n", err)
+		os.Exit(1)
+	}
+	if len(instances) == 0 {
+		fmt.Println("No SSM managed instances found.")
+		os.Exit(1)
+	}
+	if len(instances) == 1 {
+		id := instanceMap[instances[0]]
+		fmt.Printf("🏰 Auto-selected bastion: %s\n", instances[0])
+		return id
+	}
+	selected, err := prompt.Select("Select bastion instance", instances)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+	return instanceMap[selected]
+}
+
+// promptForRDS prompts for an RDS instance name or lists available ones.
+func promptForRDS(awsCfg aws.Config, prompt *ui.Prompt) (string, error) {
+	dbName, err := prompt.Input("Enter RDS DB instance name (or leave empty to browse)", nil)
+	if err != nil {
+		return "", err
+	}
+	if dbName != "" {
+		return dbName, nil
+	}
+	instances, err := listRDSInstances(awsCfg)
+	if err != nil {
+		return "", err
+	}
+	if len(instances) == 0 {
+		return "", fmt.Errorf("no RDS instances found")
+	}
+	return prompt.Select("Select RDS instance", instances)
+}
+
+// promptForRedis prompts for a Redis cluster name or lists available ones.
+func promptForRedis(awsCfg aws.Config, prompt *ui.Prompt) (string, error) {
+	clusterName, err := prompt.Input("Enter Redis cluster name (or leave empty to browse)", nil)
+	if err != nil {
+		return "", err
+	}
+	if clusterName != "" {
+		return clusterName, nil
+	}
+	clusters, err := listRedisClusters(awsCfg)
+	if err != nil {
+		return "", err
+	}
+	if len(clusters) == 0 {
+		return "", fmt.Errorf("no Redis clusters found")
+	}
+	return prompt.Select("Select Redis cluster", clusters)
+}
+
+// getAWSConfigWithToken uses an already-obtained SSO token to get AWS credentials.
+func getAWSConfigWithToken(ssoProfileName, ssoRegion string, token *ssooidc.CreateTokenOutput, region, accountId, roleName string, prompt *ui.Prompt) (*awsSession, error) {
+	ctx := context.Background()
+	ssoSvc := ssosdk.NewFromConfig(aws.Config{Region: ssoRegion})
+
+	accounts, err := ssoSvc.ListAccounts(ctx, &ssosdk.ListAccountsInput{
+		AccessToken: token.AccessToken,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list accounts: %v", err)
+	}
+
+	var accountName string
+	if accountId == "" {
 		_, accountId, err = prompt.SelectAccount(accounts)
 		if err != nil {
-			return aws.Config{}, "", "", fmt.Errorf("failed to select account: %v", err)
+			return nil, fmt.Errorf("failed to select account: %v", err)
 		}
 	}
-	fmt.Printf("🪪 Account ID: %s\n", accountId)
-
-	// List roles if role name not provided
-	if roleName == "" {
-		roles, err := ssoClient.ListAccountRoles(ctx, token, accountId)
-		if err != nil {
-			return aws.Config{}, "", "", fmt.Errorf("failed to list roles: %v", err)
+	for _, acc := range accounts.AccountList {
+		if *acc.AccountId == accountId {
+			accountName = *acc.AccountName
+			break
 		}
+	}
+	fmt.Printf("🪪 Account: %s (%s)\n", accountName, accountId)
 
-		// Select role
-		roleName, err = prompt.SelectRole(roles)
+	if roleName == "" {
+		roles, err := ssoSvc.ListAccountRoles(ctx, &ssosdk.ListAccountRolesInput{
+			AccountId:   aws.String(accountId),
+			AccessToken: token.AccessToken,
+		})
 		if err != nil {
-			return aws.Config{}, "", "", fmt.Errorf("failed to select role: %v", err)
+			return nil, fmt.Errorf("failed to list roles: %v", err)
+		}
+		roleNames := make([]string, 0, len(roles.RoleList))
+		for _, role := range roles.RoleList {
+			roleNames = append(roleNames, *role.RoleName)
+		}
+		roleName, err = prompt.Select("Select a role", roleNames)
+		if err != nil {
+			return nil, fmt.Errorf("failed to select role: %v", err)
 		}
 	}
 	fmt.Printf("👤 Role: %s\n", roleName)
 
-	// Get role credentials
-	roleCreds, err := ssoClient.GetRoleCredentials(ctx, token, accountId, roleName)
+	awsCfg, err := discovery.BuildAWSConfig(ctx, ssoRegion, token, accountId, roleName, region)
 	if err != nil {
-		return aws.Config{}, "", "", fmt.Errorf("failed to get role credentials: %v", err)
+		return nil, fmt.Errorf("failed to create AWS config: %v", err)
 	}
 
-	// Create AWS config with the role credentials and region
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion(region),
-		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			*roleCreds.RoleCredentials.AccessKeyId,
-			*roleCreds.RoleCredentials.SecretAccessKey,
-			*roleCreds.RoleCredentials.SessionToken,
-		)),
-	)
-	if err != nil {
-		return aws.Config{}, "", "", fmt.Errorf("failed to create AWS config: %v", err)
+	return &awsSession{
+		Config:      awsCfg,
+		AccountID:   accountId,
+		AccountName: accountName,
+		RoleName:    roleName,
+		Username:    getUsernameFromSTS(awsCfg),
+	}, nil
+}
+
+// awsSession holds the result of SSO authentication
+type awsSession struct {
+	Config      aws.Config
+	AccountID   string
+	AccountName string
+	RoleName    string
+	Username    string // email from STS GetCallerIdentity (e.g. dan.williams@lottie.org)
+}
+
+// isKubernetesAccount returns true if the account name indicates a kubernetes account
+func (s *awsSession) isKubernetesAccount() bool {
+	return strings.Contains(strings.ToLower(s.AccountName), "kubernetes")
+}
+
+// getAWSConfig authenticates via SSO and returns an AWS session.
+// It authenticates first, then delegates to getAWSConfigWithToken.
+func getAWSConfig(ssoProfileName, region, accountId, roleName string) (*awsSession, error) {
+	ctx := context.Background()
+	cfgManager := config.NewManager()
+	prompt := ui.NewPrompt()
+
+	var ssoRegion, startURL string
+	if ssoProfileName != "" {
+		ssoProfile, err := cfgManager.GetSSOProfile(ssoProfileName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get SSO profile '%s': %v", ssoProfileName, err)
+		}
+		ssoRegion = ssoProfile.SSORegion
+		startURL = ssoProfile.StartURL
+	} else {
+		ssoRegion = "us-east-1"
+		startURL = "https://d-906785ee68.awsapps.com/start"
 	}
 
-	return awsCfg, accountId, roleName, nil
+	ssoClient := sso.NewClient(ssoRegion, startURL)
+	token, err := ssoClient.Authenticate(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("authentication failed: %v", err)
+	}
+
+	return getAWSConfigWithToken(ssoProfileName, ssoRegion, token, region, accountId, roleName, prompt)
+}
+
+// getUsernameFromSTS extracts the username from the STS caller identity ARN.
+// ARN format: arn:aws:sts::ACCOUNT:assumed-role/ROLE/username@domain.com
+func getUsernameFromSTS(cfg aws.Config) string {
+	stsSvc := sts.NewFromConfig(cfg)
+	identity, err := stsSvc.GetCallerIdentity(context.Background(), &sts.GetCallerIdentityInput{})
+	if err != nil || identity.Arn == nil {
+		return ""
+	}
+	parts := strings.Split(*identity.Arn, "/")
+	if len(parts) >= 3 {
+		return parts[len(parts)-1]
+	}
+	return ""
+}
+
+// isBastionConnected checks if a bastion instance is reachable via SSM
+func isBastionConnected(cfg aws.Config, instanceID string) bool {
+	ssmSvc := ssm.NewFromConfig(cfg)
+	result, err := ssmSvc.DescribeInstanceInformation(context.Background(), &ssm.DescribeInstanceInformationInput{
+		Filters: []types.InstanceInformationStringFilter{
+			{
+				Key:    aws.String("InstanceIds"),
+				Values: []string{instanceID},
+			},
+		},
+	})
+	if err != nil || len(result.InstanceInformationList) == 0 {
+		return false
+	}
+	return result.InstanceInformationList[0].PingStatus == types.PingStatusOnline
 }
 
 // List all SSM managed instances that can be used as bastion hosts
@@ -786,67 +979,3 @@ func isPortInUse(port int) bool {
 	return false
 }
 
-// offerToSaveProfile prompts the user to save the manual connection configuration as a profile
-func offerToSaveProfile(cfgManager *config.Manager, prompt *ui.Prompt, ssoProfile, accountID, roleName, region, serviceType, port, bastionInstanceID, rdsInstanceName, redisClusterName string) {
-	fmt.Println() // Add some spacing
-
-	// Ask if they want to save the configuration
-	confirmed, err := prompt.Confirm("Would you like to save this configuration as a connection profile for future use?")
-	if err != nil || !confirmed {
-		return
-	}
-
-	// Prompt for profile name
-	defaultName := serviceType
-	if rdsInstanceName != "" {
-		defaultName = rdsInstanceName
-	} else if redisClusterName != "" {
-		defaultName = redisClusterName
-	}
-	profileName, err := prompt.Input("Profile name", nil, defaultName)
-	if err != nil {
-		fmt.Printf("Error getting profile name: %v\n", err)
-		return
-	}
-
-	// Ask where to save (local vs global)
-	saveLocation, err := prompt.Select("Where would you like to save this profile?", []string{"📁 Local (.bifrost.config.yaml)", "🌍 Global (~/.bifrost/config.yaml)"})
-	if err != nil {
-		fmt.Printf("Error selecting save location: %v\n", err)
-		return
-	}
-
-	// Create connection profile
-	connectionProfile := config.ConnectionProfile{
-		SSOProfile:        ssoProfile,
-		AccountID:         accountID,
-		RoleName:          roleName,
-		Region:            region,
-		ServiceType:       serviceType,
-		Port:              port,
-		BastionInstanceID: bastionInstanceID,
-		RDSInstanceName:   rdsInstanceName,
-		RedisClusterName:  redisClusterName,
-	}
-
-	// Save the profile
-	var saveErr error
-	if saveLocation == "🌍 Global (~/.bifrost/config.yaml)" {
-		saveErr = cfgManager.AddConnectionProfile(profileName, connectionProfile)
-		if saveErr == nil {
-			fmt.Printf("✅ Connection profile '%s' saved to global config\n", profileName)
-		}
-	} else {
-		saveErr = cfgManager.AddLocalConnectionProfile(profileName, connectionProfile)
-		if saveErr == nil {
-			fmt.Printf("✅ Connection profile '%s' saved to local config (.bifrost.config.yaml)\n", profileName)
-		}
-	}
-
-	if saveErr != nil {
-		fmt.Printf("❌ Error saving profile: %v\n", saveErr)
-		return
-	}
-
-	fmt.Printf("💡 You can now use this profile with: bifrost connect --profile %s\n", profileName)
-}
