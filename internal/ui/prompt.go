@@ -114,29 +114,43 @@ func (p *Prompt) SelectResource(resources []discovery.Resource, profiles []strin
 	var options []huh.Option[string]
 
 	// Add database resources
+	hasDB := false
 	for i, r := range resources {
 		if r.ServiceType == "rds" {
-			label := fmt.Sprintf("📦 %s — %s (%s:%d)", r.AccountName, r.Name, r.Engine, r.Port)
+			if !hasDB {
+				options = append(options, huh.NewOption("── Databases ──────────────", "__sep_db__"))
+				hasDB = true
+			}
+			label := fmt.Sprintf("  📦 %s — %s (%s:%d)", r.AccountName, r.Name, r.Engine, r.Port)
 			options = append(options, huh.NewOption(label, fmt.Sprintf("resource:%d", i)))
 		}
 	}
 
 	// Add redis resources
+	hasRedis := false
 	for i, r := range resources {
 		if r.ServiceType == "redis" {
-			label := fmt.Sprintf("🔴 %s — %s (redis:%d)", r.AccountName, r.Name, r.Port)
+			if !hasRedis {
+				options = append(options, huh.NewOption("── Redis ──────────────────", "__sep_redis__"))
+				hasRedis = true
+			}
+			label := fmt.Sprintf("  🔴 %s — %s (redis:%d)", r.AccountName, r.Name, r.Port)
 			options = append(options, huh.NewOption(label, fmt.Sprintf("resource:%d", i)))
 		}
 	}
 
 	// Add saved profiles
-	for _, name := range profiles {
-		label := fmt.Sprintf("🔗 %s", name)
-		options = append(options, huh.NewOption(label, "profile:"+name))
+	if len(profiles) > 0 {
+		options = append(options, huh.NewOption("── Saved Profiles ────────", "__sep_profiles__"))
+		for _, name := range profiles {
+			label := fmt.Sprintf("  🔗 %s", name)
+			options = append(options, huh.NewOption(label, "profile:"+name))
+		}
 	}
 
-	// Manual setup
-	options = append(options, huh.NewOption("⚙️  Manual setup", manualSetupKey))
+	// Separator before manual setup
+	options = append(options, huh.NewOption("──────────────────────────", "__sep_manual__"))
+	options = append(options, huh.NewOption("  ⚙️  Manual setup", manualSetupKey))
 
 	var selected string
 	form := huh.NewForm(
