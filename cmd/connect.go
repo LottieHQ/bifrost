@@ -350,7 +350,15 @@ func runProfileConnect(
 
 // runConnection handles the final connection: IAM token, port forwarding, keep-alive.
 func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort string, bastionID string, region string, iamAuthUser string, keepAlive bool, keepAliveInterval time.Duration) {
-	fmt.Printf("\n🔌 Forwarding to 127.0.0.1:%s\n", localPort)
+	fmt.Println()
+	fmt.Println("  ┌───────────────────────────────────────────────────────────┐")
+	fmt.Printf("  │  🔌 Tunnel open on localhost:%-29s│\n", localPort)
+	fmt.Println("  │                                                           │")
+	fmt.Println("  │  You can connect with any database client and credentials │")
+	fmt.Println("  │  (psql, TablePlus, DBeaver, etc.) using localhost as the  │")
+	fmt.Println("  │  host and the port above.                                 │")
+	fmt.Println("  └───────────────────────────────────────────────────────────┘")
+	fmt.Println()
 
 	if iamAuthUser != "" {
 		token, err := auth.BuildAuthToken(
@@ -364,23 +372,14 @@ func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort str
 			fmt.Printf("❌ Failed to generate IAM auth token: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("🔑 IAM auth token generated for %s (expires in ~15 min)\n\n", iamAuthUser)
+		fmt.Printf("  🔑 IAM token for %s (expires in ~15 min):\n\n", iamAuthUser)
 		psqlCmd := fmt.Sprintf("PGPASSWORD='%s' psql -h localhost -p %s -U '%s' -d postgres", token, localPort, iamAuthUser)
-		fmt.Printf("  psql:\n")
 		fmt.Printf("    %s\n\n", psqlCmd)
-		if err := clipboard.WriteAll(psqlCmd); err == nil {
-			fmt.Println("  📋 Copied to clipboard")
+		if err := clipboard.WriteAll(token); err == nil {
+			fmt.Println("  📋 Token copied to clipboard")
+			fmt.Println("  📋 Use as the password in your database client")
 		}
 		fmt.Println()
-		if strings.HasPrefix(iamAuthUser, "su-") {
-			fmt.Println("  ┌───────────────────────────────────────────────────┐")
-			fmt.Println("  │  ⚠️  Admin access requires membership of the      │")
-			fmt.Println("  │  infra-aws-database-admins Google group.          │")
-			fmt.Println("  │  A token will be generated but authentication     │")
-			fmt.Println("  │  will fail if you are not a member.               │")
-			fmt.Println("  └───────────────────────────────────────────────────┘")
-			fmt.Println()
-		}
 	}
 
 	fmt.Printf("📝 Press Ctrl+C to stop the connection\n\n")
@@ -398,7 +397,7 @@ func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort str
 func promptForAuthMethod(username string, prompt *ui.Prompt) string {
 	authOptions := []string{
 		fmt.Sprintf("🔑 IAM (%s)", username),
-		fmt.Sprintf("🔑 IAM Admin (su-%s)", username),
+		fmt.Sprintf("🔑 IAM Superuser (su-%s)", username),
 		"🔐 Password (manual)",
 	}
 	authMethod, err := prompt.Select("Authentication method", authOptions)
@@ -407,7 +406,19 @@ func promptForAuthMethod(username string, prompt *ui.Prompt) string {
 		os.Exit(1)
 	}
 	switch {
-	case strings.HasPrefix(authMethod, "🔑 IAM Admin"):
+	case strings.HasPrefix(authMethod, "🔑 IAM Superuser"):
+		fmt.Println()
+		fmt.Println("  Superuser requires the infra-aws-database-admins Google group.")
+		fmt.Println("  If you are not a member, a token will still be generated but")
+		fmt.Println("  the su- database user won't exist and authentication will fail.")
+		fmt.Println()
+		fmt.Println("  Check membership: https://groups.google.com/a/lottie.org/g/infra-aws-database-admins/members")
+		fmt.Println()
+		confirmed, err := prompt.Confirm("Continue with superuser?")
+		if err != nil || !confirmed {
+			fmt.Println("  Using standard IAM auth instead")
+			return username
+		}
 		return "su-" + username
 	case strings.HasPrefix(authMethod, "🔑 IAM ("):
 		return username
