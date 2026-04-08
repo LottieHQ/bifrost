@@ -34,6 +34,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const defaultSSORegion = "us-east-1"
+const defaultSSOStartURL = "https://d-906785ee68.awsapps.com/start"
+
 // connectCmd represents the connect command
 var connectCmd = &cobra.Command{
 	Use:   "connect",
@@ -71,7 +74,7 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 				os.Exit(1)
 			}
 			fmt.Printf("🔗 Using connection profile: %s\n", profileFlag)
-			runProfileConnect(cmd, profile, prompt, cfgManager, regionFlag, keepAliveFlag, keepAliveInterval)
+			runProfileConnect(profile, prompt, regionFlag, keepAliveFlag, keepAliveInterval)
 			return
 		}
 
@@ -89,8 +92,8 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 			ssoClient = sso.NewClient(profile.SSORegion, profile.StartURL)
 		} else {
 			// Default Lottie SSO endpoint
-			ssoRegion = "us-east-1"
-			ssoClient = sso.NewClient(ssoRegion, "https://d-906785ee68.awsapps.com/start")
+			ssoRegion = defaultSSORegion
+			ssoClient = sso.NewClient(ssoRegion, defaultSSOStartURL)
 		}
 		ctx := context.Background()
 		token, err := ssoClient.Authenticate(ctx)
@@ -151,7 +154,7 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 						os.Exit(1)
 					}
 					fmt.Printf("🔗 Using connection profile: %s\n", selectedProfileName)
-					runProfileConnect(cmd, profile, prompt, cfgManager, regionFlag, keepAliveFlag, keepAliveInterval)
+					runProfileConnect(profile, prompt, regionFlag, keepAliveFlag, keepAliveInterval)
 					return
 				}
 
@@ -287,10 +290,8 @@ func runDiscoveredConnect(
 
 // runProfileConnect handles connection using a saved profile.
 func runProfileConnect(
-	cmd *cobra.Command,
 	profile *config.ConnectionProfile,
 	prompt *ui.Prompt,
-	cfgManager *config.Manager,
 	regionFlag string,
 	keepAlive bool,
 	keepAliveInterval time.Duration,
@@ -372,7 +373,8 @@ func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort str
 				fmt.Printf("❌ Failed to generate IAM auth token: %v\n", err)
 			} else {
 				fmt.Printf("\n🔑 IAM token for %s (expires in ~15 min):\n\n", iamAuthUser)
-				psqlCmd := fmt.Sprintf("PGPASSWORD='%s' psql -h localhost -p %s -U '%s' -d postgres", token, localPort, iamAuthUser)
+				safeUser := strings.ReplaceAll(iamAuthUser, "'", "'\\''")
+			psqlCmd := fmt.Sprintf("PGPASSWORD='%s' psql -h localhost -p %s -U '%s' -d postgres", token, localPort, safeUser)
 				fmt.Printf("  %s\n\n", psqlCmd)
 				if err := clipboard.WriteAll(token); err == nil {
 					fmt.Println("📋 Token copied to clipboard — use as the password in your database client")
@@ -665,8 +667,8 @@ func getAWSConfig(ssoProfileName, region, accountId, roleName string) (*awsSessi
 		ssoRegion = ssoProfile.SSORegion
 		startURL = ssoProfile.StartURL
 	} else {
-		ssoRegion = "us-east-1"
-		startURL = "https://d-906785ee68.awsapps.com/start"
+		ssoRegion = defaultSSORegion
+		startURL = defaultSSOStartURL
 	}
 
 	ssoClient := sso.NewClient(ssoRegion, startURL)

@@ -85,15 +85,6 @@ func (p *Prompt) SelectAccount(accounts *sso.ListAccountsOutput) (string, string
 	return selected, accountMap[selected], nil
 }
 
-// SelectRole prompts the user to select a role
-func (p *Prompt) SelectRole(roles *sso.ListAccountRolesOutput) (string, error) {
-	roleNames := make([]string, 0, len(roles.RoleList))
-	for _, role := range roles.RoleList {
-		roleNames = append(roleNames, *role.RoleName)
-	}
-	return p.Select("Select a role", roleNames)
-}
-
 const manualSetupKey = "__manual__"
 
 var dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("248"))
@@ -117,30 +108,25 @@ func (p *Prompt) SelectResource(resources []discovery.Resource, profiles []strin
 	// Build options: value is index into resources array, or special sentinel
 	var options []huh.Option[string]
 
-	// Add database resources
-	hasDB := false
+	// Add resources with section headers when service type changes
+	var currentType string
 	for i, r := range resources {
-		if r.ServiceType == "rds" {
-			if !hasDB {
+		if r.ServiceType != currentType {
+			currentType = r.ServiceType
+			switch currentType {
+			case "rds":
 				options = append(options, huh.NewOption(dimStyle.Render("── Databases ─────────────────────"), "__sep_db__"))
-				hasDB = true
-			}
-			label := fmt.Sprintf("  📦 %s — %s (%s:%d)", r.AccountName, r.Name, r.Engine, r.Port)
-			options = append(options, huh.NewOption(label, fmt.Sprintf("resource:%d", i)))
-		}
-	}
-
-	// Add redis resources
-	hasRedis := false
-	for i, r := range resources {
-		if r.ServiceType == "redis" {
-			if !hasRedis {
+			case "redis":
 				options = append(options, huh.NewOption(dimStyle.Render("── Redis ─────────────────────────"), "__sep_redis__"))
-				hasRedis = true
 			}
-			label := fmt.Sprintf("  🔶 %s — %s (redis:%d)", r.AccountName, r.Name, r.Port)
-			options = append(options, huh.NewOption(label, fmt.Sprintf("resource:%d", i)))
 		}
+		var label string
+		if r.ServiceType == "redis" {
+			label = fmt.Sprintf("  🔶 %s — %s (redis:%d)", r.AccountName, r.Name, r.Port)
+		} else {
+			label = fmt.Sprintf("  📦 %s — %s (%s:%d)", r.AccountName, r.Name, r.Engine, r.Port)
+		}
+		options = append(options, huh.NewOption(label, fmt.Sprintf("resource:%d", i)))
 	}
 
 	// Add saved profiles
