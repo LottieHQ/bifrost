@@ -5,6 +5,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -340,12 +341,17 @@ func runProfileConnect(
 // user that the tunnel is open before asking about authentication.
 func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort string, bastionID string, region string, iamAuthEnabled bool, username string, prompt *ui.Prompt, keepAlive bool, keepAliveInterval time.Duration) {
 	// Start SSM tunnel in background
-	ssmCmd, errChan, ctx, cancel, sigChan := startSSMTunnel(awsCfg, bastionID, endpoint, port, localPort, region)
-	defer cancel()
+	tunnel := startSSMTunnel(awsCfg, bastionID, endpoint, port, localPort, region)
+	defer tunnel.Cancel()
+	defer tunnel.terminate(awsCfg)
 
 	// Wait for tunnel to be ready
 	fmt.Println("\n⏳ Waiting for tunnel...")
-	ready := waitForTunnelReady(ctx, localPort)
+	ready, err := waitForTunnelReady(tunnel.Ctx, localPort, tunnel.ErrChan)
+	if err != nil {
+		fmt.Printf("❌ %v\n", err)
+		os.Exit(1)
+	}
 	if !ready {
 		fmt.Println("❌ Tunnel did not become ready within 30 seconds")
 		os.Exit(1)
@@ -389,45 +395,108 @@ func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort str
 	// Start keep alive
 	if keepAlive {
 		fmt.Printf("💓 Keep alive enabled (interval: %v)\n", keepAliveInterval)
-		go startKeepAlive(ctx, localPort, keepAliveInterval)
+		go startKeepAlive(tunnel.Ctx, localPort, keepAliveInterval)
 	}
 
 	// Wait for SSM to finish or signal
 	select {
-	case err := <-errChan:
+	case err := <-tunnel.ErrChan:
 		if err != nil {
 			fmt.Printf("Error: SSM session ended: %v\n", err)
 			os.Exit(1)
 		}
-	case <-sigChan:
+	case <-tunnel.SigChan:
 		fmt.Println("\n🛑 Shutting down connection...")
-		cancel()
-		if ssmCmd.Process != nil {
-			_ = ssmCmd.Process.Signal(syscall.SIGTERM)
+		tunnel.Cancel()
+		if tunnel.Cmd.Process != nil {
+			_ = tunnel.Cmd.Process.Signal(syscall.SIGTERM)
 		}
 		time.Sleep(1 * time.Second)
 	}
 }
 
-// startSSMTunnel launches the SSM port forwarding subprocess and returns
-// the command, error channel, context, cancel func, and signal channel.
-func startSSMTunnel(cfg aws.Config, instanceID, endpoint string, port int32, localPort string, region string) (*exec.Cmd, chan error, context.Context, context.CancelFunc, chan os.Signal) {
-	ssmArgs := []string{
-		"ssm", "start-session",
-		"--target", instanceID,
-		"--region", region,
-		"--document-name", "AWS-StartPortForwardingSessionToRemoteHost",
-		"--parameters", fmt.Sprintf("host=%s,portNumber=%d,localPortNumber=%s", endpoint, port, localPort),
+// ssmTunnel holds the state of an active SSM tunnel so it can be cleaned up.
+type ssmTunnel struct {
+	Cmd       *exec.Cmd
+	SessionID string
+	Region    string
+	ErrChan   chan error
+	Ctx       context.Context
+	Cancel    context.CancelFunc
+	SigChan   chan os.Signal
+}
+
+// terminate cleanly shuts down the SSM session via the API.
+func (t *ssmTunnel) terminate(cfg aws.Config) {
+	if t.SessionID == "" {
+		return
+	}
+	ssmSvc := ssm.NewFromConfig(cfg, func(o *ssm.Options) { o.Region = t.Region })
+	_, _ = ssmSvc.TerminateSession(context.Background(), &ssm.TerminateSessionInput{
+		SessionId: aws.String(t.SessionID),
+	})
+}
+
+// startSSMTunnel starts an SSM port-forwarding session by calling the
+// StartSession API directly and then invoking session-manager-plugin.
+// This removes the runtime dependency on the aws CLI (and Python).
+func startSSMTunnel(cfg aws.Config, instanceID, endpoint string, port int32, localPort string, region string) *ssmTunnel {
+	if _, err := exec.LookPath("session-manager-plugin"); err != nil {
+		fmt.Println("❌ session-manager-plugin is not installed.")
+		fmt.Println("💡 Install it with: brew install --cask session-manager-plugin")
+		os.Exit(1)
 	}
 
-	cmd := exec.Command("aws", ssmArgs...)
+	ssmSvc := ssm.NewFromConfig(cfg, func(o *ssm.Options) { o.Region = region })
 
+	docName := "AWS-StartPortForwardingSessionToRemoteHost"
+	input := &ssm.StartSessionInput{
+		Target:       aws.String(instanceID),
+		DocumentName: aws.String(docName),
+		Parameters: map[string][]string{
+			"host":            {endpoint},
+			"portNumber":      {fmt.Sprintf("%d", port)},
+			"localPortNumber": {localPort},
+		},
+	}
+
+	sess, err := ssmSvc.StartSession(context.Background(), input)
+	if err != nil {
+		fmt.Printf("Failed to start SSM session: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Marshal only the fields the plugin expects — the SDK structs include
+	// extra fields (ResultMetadata, Reason) that can confuse the plugin.
+	sessJSON, _ := json.Marshal(map[string]string{
+		"SessionId": aws.ToString(sess.SessionId),
+		"StreamUrl": aws.ToString(sess.StreamUrl),
+		"TokenValue": aws.ToString(sess.TokenValue),
+	})
+	inputJSON, _ := json.Marshal(map[string]any{
+		"Target":       aws.ToString(input.Target),
+		"DocumentName": aws.ToString(input.DocumentName),
+		"Parameters":   input.Parameters,
+	})
+
+	ssmEndpoint := fmt.Sprintf("https://ssm.%s.amazonaws.com", region)
+
+	// session-manager-plugin <session-json> <region> StartSession <profile> <input-json> <endpoint>
+	cmd := exec.Command("session-manager-plugin",
+		string(sessJSON),
+		region,
+		"StartSession",
+		"",
+		string(inputJSON),
+		ssmEndpoint,
+	)
+
+	// The plugin needs AWS credentials to sign the WebSocket connection.
 	creds, err := cfg.Credentials.Retrieve(context.Background())
 	if err != nil {
 		fmt.Printf("Failed to get credentials: %v\n", err)
 		os.Exit(1)
 	}
-
 	cmd.Env = append(os.Environ(),
 		"AWS_ACCESS_KEY_ID="+creds.AccessKeyID,
 		"AWS_SECRET_ACCESS_KEY="+creds.SecretAccessKey,
@@ -449,27 +518,40 @@ func startSSMTunnel(cfg aws.Config, instanceID, endpoint string, port int32, loc
 		errChan <- cmd.Run()
 	}()
 
-	return cmd, errChan, ctx, cancel, sigChan
+	return &ssmTunnel{
+		Cmd:       cmd,
+		SessionID: aws.ToString(sess.SessionId),
+		Region:    region,
+		ErrChan:   errChan,
+		Ctx:       ctx,
+		Cancel:    cancel,
+		SigChan:   sigChan,
+	}
 }
 
-// waitForTunnelReady polls the local port until the SSM tunnel is accepting connections.
-func waitForTunnelReady(ctx context.Context, localPort string) bool {
+// waitForTunnelReady polls the local port until the SSM tunnel is accepting
+// connections, or returns early if the plugin process exits.
+func waitForTunnelReady(ctx context.Context, localPort string, errChan <-chan error) (bool, error) {
 	for range 60 { // 30 seconds at 500ms intervals
 		select {
 		case <-ctx.Done():
-			return false
+			return false, nil
+		case err := <-errChan:
+			return false, fmt.Errorf("session-manager-plugin exited: %w", err)
 		default:
 		}
 		if err := performKeepAlive(localPort); err == nil {
-			return true
+			return true, nil
 		}
 		select {
 		case <-ctx.Done():
-			return false
+			return false, nil
+		case err := <-errChan:
+			return false, fmt.Errorf("session-manager-plugin exited: %w", err)
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
-	return false
+	return false, nil
 }
 
 // promptForAuthMethod asks the user to pick IAM / IAM Admin / Password.
