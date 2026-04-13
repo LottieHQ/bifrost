@@ -60,8 +60,6 @@ homebrew_casks:
     description: "A command-line utility to simplify connecting to AWS RDS/Redis instances through bastion hosts utilising AWS SSM Session Manager."
 
     dependencies:
-      - formula: awscli
-      - formula: gh
       - cask: session-manager-plugin
 
     repository:
