@@ -9,6 +9,7 @@ import (
 	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/LottieHQ/bifrost/internal/discovery"
+	"github.com/LottieHQ/bifrost/internal/portcache"
 )
 
 // Prompt handles user interactions
@@ -120,11 +121,17 @@ func (p *Prompt) SelectResource(resources []discovery.Resource, profiles []strin
 				options = append(options, huh.NewOption(dimStyle.Render("── Redis ─────────────────────────"), "__sep_redis__"))
 			}
 		}
+		// Show the port the user will actually forward to: their remembered
+		// choice if one exists, otherwise the remote service port.
+		displayPort := fmt.Sprintf("%d", r.Port)
+		if cached, ok := portcache.Get(r.AccountID, r.Name); ok {
+			displayPort = cached
+		}
 		var label string
 		if r.ServiceType == "redis" {
-			label = fmt.Sprintf("  🔶 %s — %s (redis:%d)", r.AccountName, r.Name, r.Port)
+			label = fmt.Sprintf("  🔶 %s — %s (redis:%s)", r.AccountName, r.Name, displayPort)
 		} else {
-			label = fmt.Sprintf("  📦 %s — %s (%s:%d)", r.AccountName, r.Name, r.Engine, r.Port)
+			label = fmt.Sprintf("  📦 %s — %s (%s:%s)", r.AccountName, r.Name, r.Engine, displayPort)
 		}
 		options = append(options, huh.NewOption(label, fmt.Sprintf("resource:%d", i)))
 	}
