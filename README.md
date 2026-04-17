@@ -108,7 +108,7 @@ To update bifrost to the latest version:
 ## Developing
 ### Requirements
 
-- Go 1.24+
+- Go 1.25+
 - AWS SSM Session Manager Plugin [brew install --cask session-manager-plugin](https://formulae.brew.sh/cask/session-manager-plugin#default) or [official docs](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
 
 

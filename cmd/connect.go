@@ -568,16 +568,11 @@ func promptForAuthMethod(username string, prompt *ui.Prompt) string {
 	}
 	switch {
 	case strings.HasPrefix(authMethod, "🔑 IAM Superuser"):
-		fmt.Println()
-		fmt.Println("  ⚠️  ┌──────────────────────────────────────────────────────────────────────────────────────┐")
-		fmt.Println("  ⚠️  │  Superuser requires the infra-aws-database-admins Google group.                      │")
-		fmt.Println("  ⚠️  │  If you are not a member, a token will still be generated but the su- database       │")
-		fmt.Println("  ⚠️  │  user won't exist and authentication will fail.                                      │")
-		fmt.Println("  ⚠️  │                                                                                      │")
-		fmt.Println("  ⚠️  │  Check: https://groups.google.com/a/lottie.org/g/infra-aws-database-admins/members   │")
-		fmt.Println("  ⚠️  └──────────────────────────────────────────────────────────────────────────────────────┘")
-		fmt.Println()
-		confirmed, err := prompt.Confirm("Continue with superuser?")
+		warning := "⚠️  Superuser requires the infra-aws-database-admins Google group. " +
+			"If you are not a member, a token will still be generated but the su- database " +
+			"user won't exist and authentication will fail.\n\n" +
+			"https://groups.google.com/a/lottie.org/g/infra-aws-database-admins/members"
+		confirmed, err := prompt.Confirm("Continue with superuser?", warning)
 		if err != nil || !confirmed {
 			fmt.Println("Using standard IAM auth instead")
 			return username
