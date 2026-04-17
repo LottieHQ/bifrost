@@ -28,6 +28,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/LottieHQ/bifrost/internal/config"
 	"github.com/LottieHQ/bifrost/internal/discovery"
+	"github.com/LottieHQ/bifrost/internal/portcache"
 	"github.com/LottieHQ/bifrost/internal/sso"
 	"github.com/LottieHQ/bifrost/internal/ui"
 	ssosdk "github.com/aws/aws-sdk-go-v2/service/sso"
@@ -271,12 +272,19 @@ func runDiscoveredConnect(
 		os.Exit(1)
 	}
 
-	// Prompt for local port with sensible default
+	// Default to the last port the user forwarded to for this resource, falling
+	// back to the remote port if there's no cached choice.
 	defaultPort := fmt.Sprintf("%d", res.Port)
+	if cached, ok := portcache.Get(res.AccountID, res.Name); ok {
+		defaultPort = cached
+	}
 	portFlag, err := prompt.Input("Local port", validatePort, defaultPort)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
+	}
+	if err := portcache.Set(res.AccountID, res.Name, portFlag); err != nil {
+		fmt.Printf("⚠️  Could not persist port choice: %v\n", err)
 	}
 
 	// Validate bastion
