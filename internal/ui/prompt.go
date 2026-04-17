@@ -6,8 +6,8 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/sso"
-	"github.com/charmbracelet/huh"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/huh/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/LottieHQ/bifrost/internal/discovery"
 )
 
@@ -182,18 +182,21 @@ func (p *Prompt) SelectResource(resources []discovery.Resource, profiles []strin
 	}
 }
 
-// Confirm prompts the user for a yes/no confirmation
-func (p *Prompt) Confirm(label string) (bool, error) {
+// Confirm prompts the user for a yes/no confirmation. An optional description
+// may be passed to render context above the yes/no buttons, inside the same
+// form — this keeps the text under Huh's renderer so it redraws cleanly on
+// terminal resize instead of stacking duplicate copies in the scrollback.
+func (p *Prompt) Confirm(label string, description ...string) (bool, error) {
 	var confirm bool
-	form := huh.NewForm(
-		huh.NewGroup(
-			huh.NewConfirm().
-				Title(label).
-				Affirmative("Yes!").
-				Negative("No.").
-				Value(&confirm),
-		),
-	)
+	c := huh.NewConfirm().
+		Title(label).
+		Affirmative("Yes!").
+		Negative("No.").
+		Value(&confirm)
+	if len(description) > 0 && description[0] != "" {
+		c = c.Description(description[0])
+	}
+	form := huh.NewForm(huh.NewGroup(c))
 
 	if err := form.Run(); err != nil {
 		return false, fmt.Errorf("confirmation failed: %w", err)
