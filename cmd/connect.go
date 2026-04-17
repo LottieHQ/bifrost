@@ -275,10 +275,12 @@ func runDiscoveredConnect(
 	// Default to the last port the user forwarded to for this resource, falling
 	// back to the remote port if there's no cached choice.
 	defaultPort := fmt.Sprintf("%d", res.Port)
+	portLabel := "Local port"
 	if cached, ok := portcache.Get(res.AccountID, res.Name); ok {
 		defaultPort = cached
+		portLabel = "Local port (last used)"
 	}
-	portFlag, err := prompt.Input("Local port", validatePort, defaultPort)
+	portFlag, err := prompt.Input(portLabel, validatePort, defaultPort)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
