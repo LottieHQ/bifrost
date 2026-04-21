@@ -25,13 +25,11 @@ func getTokenCachePath(startURL string) (string, error) {
 		return "", err
 	}
 
-	// Use the same cache directory as AWS CLI
 	cacheDir := filepath.Join(homeDir, ".aws", "sso", "cache")
 	if err := os.MkdirAll(cacheDir, 0700); err != nil {
 		return "", err
 	}
 
-	// Generate hash of start URL for filename
 	hash := fmt.Sprintf("%x", sha1.Sum([]byte(startURL)))
 	return filepath.Join(cacheDir, hash+".json"), nil
 }
@@ -72,6 +70,35 @@ func SaveTokenCache(token *TokenCache) error {
 	return os.WriteFile(path, data, 0600)
 }
 
+func DeleteTokenCache(startURL string) error {
+	path, err := getTokenCachePath(startURL)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func (t *TokenCache) IsFresh() bool {
+	if t == nil {
+		return false
+	}
+	return time.Now().Add(tokenExpirySkew).Before(t.ExpiresAt)
+}
+
+func (t *TokenCache) CanRefresh() bool {
+	if t == nil {
+		return false
+	}
+	return t.RefreshToken != "" && t.ClientId != "" && t.ClientSecret != ""
+}
+
+// tokenExpirySkew treats tokens as expired early so we refresh before the server
+// rejects them; without it we'd race server-side expiry and surface a 401.
+const tokenExpirySkew = 60 * time.Second
+
 func ClearTokenCache() error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -79,13 +106,11 @@ func ClearTokenCache() error {
 	}
 
 	cacheDir := filepath.Join(homeDir, ".aws", "sso", "cache")
-	
-	// Check if cache directory exists
+
 	if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
-		return nil // Nothing to clear
+		return nil
 	}
 
-	// Remove all cache files
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
 		return err

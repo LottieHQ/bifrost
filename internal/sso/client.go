@@ -2,23 +2,23 @@ package sso
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sso"
+	ssotypes "github.com/aws/aws-sdk-go-v2/service/sso/types"
 	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
 	"github.com/pkg/browser"
 )
 
-// Client represents an SSO client that handles authentication and token management
 type Client struct {
 	region   string
 	startURL string
 }
 
-// NewClient creates a new SSO client
 func NewClient(region, startURL string) *Client {
 	return &Client{
 		region:   region,
@@ -26,24 +26,67 @@ func NewClient(region, startURL string) *Client {
 	}
 }
 
-// Authenticate handles the SSO authentication flow
 func (c *Client) Authenticate(ctx context.Context) (*ssooidc.CreateTokenOutput, error) {
-	// Check for cached token
 	cachedToken, err := LoadTokenCache(c.startURL)
 	if err != nil {
 		log.Printf("⚠️ Warning: Failed to load cached token: %v", err)
 	}
 
-	if cachedToken != nil && time.Now().Before(cachedToken.ExpiresAt) {
+	if cachedToken.IsFresh() {
 		fmt.Println("🔄 Using cached SSO token...")
 		return &ssooidc.CreateTokenOutput{
 			AccessToken: aws.String(cachedToken.AccessToken),
 		}, nil
 	}
 
-	// Step 1: Begin device authorization
 	ssoOidc := ssooidc.NewFromConfig(aws.Config{Region: c.region})
 
+	if cachedToken.CanRefresh() {
+		token, err := c.refreshToken(ctx, ssoOidc, cachedToken)
+		if err == nil {
+			fmt.Println("🔄 Refreshed SSO token...")
+			return token, nil
+		}
+		log.Printf("⚠️ Token refresh failed, falling back to device flow: %v", err)
+		if delErr := DeleteTokenCache(c.startURL); delErr != nil {
+			log.Printf("⚠️ Warning: Failed to remove stale token cache: %v", delErr)
+		}
+	}
+
+	return c.deviceFlow(ctx, ssoOidc)
+}
+
+func (c *Client) Reauthenticate(ctx context.Context) (*ssooidc.CreateTokenOutput, error) {
+	if err := DeleteTokenCache(c.startURL); err != nil {
+		log.Printf("⚠️ Warning: Failed to remove token cache: %v", err)
+	}
+	return c.Authenticate(ctx)
+}
+
+func IsUnauthorizedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *ssotypes.UnauthorizedException
+	return errors.As(err, &ue)
+}
+
+func (c *Client) refreshToken(ctx context.Context, ssoOidc *ssooidc.Client, cached *TokenCache) (*ssooidc.CreateTokenOutput, error) {
+	token, err := ssoOidc.CreateToken(ctx, &ssooidc.CreateTokenInput{
+		ClientId:     aws.String(cached.ClientId),
+		ClientSecret: aws.String(cached.ClientSecret),
+		GrantType:    aws.String("refresh_token"),
+		RefreshToken: aws.String(cached.RefreshToken),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	c.persistToken(token, cached.ClientId, cached.ClientSecret)
+	return token, nil
+}
+
+func (c *Client) deviceFlow(ctx context.Context, ssoOidc *ssooidc.Client) (*ssooidc.CreateTokenOutput, error) {
 	register, err := ssoOidc.RegisterClient(ctx, &ssooidc.RegisterClientInput{
 		ClientName: aws.String("bifrost"),
 		ClientType: aws.String("public"),
@@ -63,7 +106,6 @@ func (c *Client) Authenticate(ctx context.Context) (*ssooidc.CreateTokenOutput, 
 
 	verificationURL := *deviceAuth.VerificationUriComplete
 
-	// Open the URL in the default browser
 	if err := browser.OpenURL(verificationURL); err != nil {
 		fmt.Println("❌ Error opening browser:", err)
 	}
@@ -72,25 +114,15 @@ func (c *Client) Authenticate(ctx context.Context) (*ssooidc.CreateTokenOutput, 
 	fmt.Printf("🔑 Code: %s\n", *deviceAuth.UserCode)
 	fmt.Printf("🌐 URL: %s\n", verificationURL)
 
-	// Step 2: Poll for token
-	var token *ssooidc.CreateTokenOutput
-	maxRetries := 300 // Maximum number of retries (5 minutes with 1-second interval from AWS)
-	retryCount := 0
-
+	maxRetries := 300
 	fmt.Printf("🔄 Polling every %d seconds (timeout after %d attempts)\n\n", deviceAuth.Interval, maxRetries)
 
-	for {
-		// Check for context cancellation
+	var token *ssooidc.CreateTokenOutput
+	for retryCount := 0; retryCount < maxRetries; retryCount++ {
 		select {
 		case <-ctx.Done():
 			return nil, fmt.Errorf("context cancelled while waiting for token: %w", ctx.Err())
 		default:
-			// Continue with polling
-		}
-
-		// Check if we've exceeded the maximum retry count
-		if retryCount >= maxRetries {
-			return nil, fmt.Errorf("maximum retry count exceeded while waiting for token")
 		}
 
 		time.Sleep(time.Duration(deviceAuth.Interval) * time.Second)
@@ -101,32 +133,36 @@ func (c *Client) Authenticate(ctx context.Context) (*ssooidc.CreateTokenOutput, 
 			GrantType:    aws.String("urn:ietf:params:oauth:grant-type:device_code"),
 		})
 		if err == nil {
-			break
+			c.persistToken(token, *register.ClientId, *register.ClientSecret)
+			return token, nil
 		}
 
-		retryCount++
-		if retryCount%10 == 0 {
-			fmt.Printf("⏳ Still waiting for authentication... (%d/%d attempts)\n", retryCount, maxRetries)
+		if (retryCount+1)%10 == 0 {
+			fmt.Printf("⏳ Still waiting for authentication... (%d/%d attempts)\n", retryCount+1, maxRetries)
 		}
 	}
+	return nil, fmt.Errorf("maximum retry count exceeded while waiting for token")
+}
 
-	// Cache the new token
-	cacheToken := &TokenCache{
-		AccessToken:  *token.AccessToken,
-		ExpiresAt:    time.Now().Add(8 * time.Hour), // SSO tokens typically expire in 8 hours
-		ClientId:     *register.ClientId,
-		ClientSecret: *register.ClientSecret,
+func (c *Client) persistToken(token *ssooidc.CreateTokenOutput, clientID, clientSecret string) {
+	ttl := time.Duration(token.ExpiresIn) * time.Second
+	if ttl <= 0 {
+		ttl = 8 * time.Hour
+	}
+	cache := &TokenCache{
+		AccessToken:  aws.ToString(token.AccessToken),
+		RefreshToken: aws.ToString(token.RefreshToken),
+		ExpiresAt:    time.Now().Add(ttl),
+		ClientId:     clientID,
+		ClientSecret: clientSecret,
 		StartUrl:     c.startURL,
 		Region:       c.region,
 	}
-	if err := SaveTokenCache(cacheToken); err != nil {
+	if err := SaveTokenCache(cache); err != nil {
 		log.Printf("⚠️ Warning: Failed to cache token: %v", err)
 	}
-
-	return token, nil
 }
 
-// ListAccounts returns a list of available AWS accounts
 func (c *Client) ListAccounts(ctx context.Context, token *ssooidc.CreateTokenOutput) (*sso.ListAccountsOutput, error) {
 	ssoClient := sso.NewFromConfig(aws.Config{Region: c.region})
 	return ssoClient.ListAccounts(ctx, &sso.ListAccountsInput{
@@ -134,7 +170,6 @@ func (c *Client) ListAccounts(ctx context.Context, token *ssooidc.CreateTokenOut
 	})
 }
 
-// ListAccountRoles returns a list of available roles for an account
 func (c *Client) ListAccountRoles(ctx context.Context, token *ssooidc.CreateTokenOutput, accountId string) (*sso.ListAccountRolesOutput, error) {
 	ssoClient := sso.NewFromConfig(aws.Config{Region: c.region})
 	return ssoClient.ListAccountRoles(ctx, &sso.ListAccountRolesInput{
@@ -143,7 +178,6 @@ func (c *Client) ListAccountRoles(ctx context.Context, token *ssooidc.CreateToke
 	})
 }
 
-// GetRoleCredentials returns credentials for a specific role
 func (c *Client) GetRoleCredentials(ctx context.Context, token *ssooidc.CreateTokenOutput, accountId, roleName string) (*sso.GetRoleCredentialsOutput, error) {
 	ssoClient := sso.NewFromConfig(aws.Config{Region: c.region})
 	return ssoClient.GetRoleCredentials(ctx, &sso.GetRoleCredentialsInput{
