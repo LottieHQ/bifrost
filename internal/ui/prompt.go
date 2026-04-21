@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -11,6 +13,12 @@ import (
 	"github.com/LottieHQ/bifrost/internal/discovery"
 	"github.com/LottieHQ/bifrost/internal/portcache"
 )
+
+func exitIfAborted(err error) {
+	if errors.Is(err, huh.ErrUserAborted) {
+		os.Exit(130)
+	}
+}
 
 // Prompt handles user interactions
 type Prompt struct{}
@@ -33,6 +41,7 @@ func (p *Prompt) Select(label string, items []string) (string, error) {
 	)
 
 	if err := form.Run(); err != nil {
+		exitIfAborted(err)
 		return "", fmt.Errorf("select failed: %w", err)
 	}
 	return selected, nil
@@ -62,6 +71,7 @@ func (p *Prompt) Input(label string, validate func(string) error, defaultValue .
 	)
 
 	if err := form.Run(); err != nil {
+		exitIfAborted(err)
 		return "", fmt.Errorf("input failed: %w", err)
 	}
 	return result, nil
@@ -161,6 +171,7 @@ func (p *Prompt) SelectResource(resources []discovery.Resource, profiles []strin
 		)
 
 		if err := form.Run(); err != nil {
+			exitIfAborted(err)
 			return nil, "", fmt.Errorf("select failed: %w", err)
 		}
 
@@ -206,6 +217,7 @@ func (p *Prompt) Confirm(label string, description ...string) (bool, error) {
 	form := huh.NewForm(huh.NewGroup(c))
 
 	if err := form.Run(); err != nil {
+		exitIfAborted(err)
 		return false, fmt.Errorf("confirmation failed: %w", err)
 	}
 	return confirm, nil

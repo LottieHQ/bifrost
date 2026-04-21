@@ -421,7 +421,13 @@ func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort str
 		if tunnel.Cmd.Process != nil {
 			_ = tunnel.Cmd.Process.Signal(syscall.SIGTERM)
 		}
-		time.Sleep(1 * time.Second)
+		select {
+		case <-tunnel.ErrChan:
+		case <-time.After(300 * time.Millisecond):
+			if tunnel.Cmd.Process != nil {
+				_ = tunnel.Cmd.Process.Kill()
+			}
+		}
 	}
 }
 
@@ -442,7 +448,9 @@ func (t *ssmTunnel) terminate(cfg aws.Config) {
 		return
 	}
 	ssmSvc := ssm.NewFromConfig(cfg, func(o *ssm.Options) { o.Region = t.Region })
-	_, _ = ssmSvc.TerminateSession(context.Background(), &ssm.TerminateSessionInput{
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_, _ = ssmSvc.TerminateSession(ctx, &ssm.TerminateSessionInput{
 		SessionId: aws.String(t.SessionID),
 	})
 }
