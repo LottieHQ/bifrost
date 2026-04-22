@@ -104,10 +104,18 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 			os.Exit(1)
 		}
 
-		// --- Discovery flow (unless manual flags are set) ---
-		manualMode := accountIdFlag != "" || serviceTypeFlag != "" // user passed manual flags
+		manualMode := accountIdFlag != "" || serviceTypeFlag != ""
 		if !manualMode {
 			accounts, err := ssoClient.ListAccounts(ctx, token)
+			if sso.IsUnauthorizedErr(err) {
+				fmt.Println("⚠️ Cached SSO token was rejected, re-authenticating...")
+				token, err = ssoClient.Reauthenticate(ctx)
+				if err != nil {
+					fmt.Printf("Authentication failed: %v\n", err)
+					os.Exit(1)
+				}
+				accounts, err = ssoClient.ListAccounts(ctx, token)
+			}
 			if err != nil {
 				fmt.Printf("Error listing accounts: %v\n", err)
 				os.Exit(1)
@@ -680,6 +688,16 @@ func getAWSConfigWithToken(ssoProfileName, ssoRegion string, token *ssooidc.Crea
 	accounts, err := ssoSvc.ListAccounts(ctx, &ssosdk.ListAccountsInput{
 		AccessToken: token.AccessToken,
 	})
+	if sso.IsUnauthorizedErr(err) {
+		fmt.Println("⚠️ Cached SSO token was rejected, re-authenticating...")
+		token, err = reauthenticate(ctx, ssoProfileName)
+		if err != nil {
+			return nil, fmt.Errorf("re-authentication failed: %v", err)
+		}
+		accounts, err = ssoSvc.ListAccounts(ctx, &ssosdk.ListAccountsInput{
+			AccessToken: token.AccessToken,
+		})
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to list accounts: %v", err)
 	}
@@ -750,29 +768,42 @@ func (s *awsSession) isKubernetesAccount() bool {
 // It authenticates first, then delegates to getAWSConfigWithToken.
 func getAWSConfig(ssoProfileName, region, accountId, roleName string) (*awsSession, error) {
 	ctx := context.Background()
-	cfgManager := config.NewManager()
 	prompt := ui.NewPrompt()
 
-	var ssoRegion, startURL string
-	if ssoProfileName != "" {
-		ssoProfile, err := cfgManager.GetSSOProfile(ssoProfileName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get SSO profile '%s': %v", ssoProfileName, err)
-		}
-		ssoRegion = ssoProfile.SSORegion
-		startURL = ssoProfile.StartURL
-	} else {
-		ssoRegion = defaultSSORegion
-		startURL = defaultSSOStartURL
+	ssoRegion, _, err := resolveSSOEndpoint(ssoProfileName)
+	if err != nil {
+		return nil, err
 	}
 
-	ssoClient := sso.NewClient(ssoRegion, startURL)
-	token, err := ssoClient.Authenticate(ctx)
+	token, err := newSSOClient(ssoProfileName).Authenticate(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("authentication failed: %v", err)
 	}
 
 	return getAWSConfigWithToken(ssoProfileName, ssoRegion, token, region, accountId, roleName, prompt)
+}
+
+func reauthenticate(ctx context.Context, ssoProfileName string) (*ssooidc.CreateTokenOutput, error) {
+	return newSSOClient(ssoProfileName).Reauthenticate(ctx)
+}
+
+func newSSOClient(ssoProfileName string) *sso.Client {
+	ssoRegion, startURL, err := resolveSSOEndpoint(ssoProfileName)
+	if err != nil {
+		ssoRegion, startURL = defaultSSORegion, defaultSSOStartURL
+	}
+	return sso.NewClient(ssoRegion, startURL)
+}
+
+func resolveSSOEndpoint(ssoProfileName string) (region, startURL string, err error) {
+	if ssoProfileName == "" {
+		return defaultSSORegion, defaultSSOStartURL, nil
+	}
+	ssoProfile, err := config.NewManager().GetSSOProfile(ssoProfileName)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get SSO profile '%s': %v", ssoProfileName, err)
+	}
+	return ssoProfile.SSORegion, ssoProfile.StartURL, nil
 }
 
 // getUsernameFromSTS extracts the username from the STS caller identity ARN.
