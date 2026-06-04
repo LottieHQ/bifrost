@@ -17,6 +17,11 @@ import (
 
 	"strings"
 
+	"github.com/LottieHQ/bifrost/internal/config"
+	"github.com/LottieHQ/bifrost/internal/discovery"
+	"github.com/LottieHQ/bifrost/internal/portcache"
+	"github.com/LottieHQ/bifrost/internal/sso"
+	"github.com/LottieHQ/bifrost/internal/ui"
 	"github.com/atotto/clipboard"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/rds/auth"
@@ -25,14 +30,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/aws-sdk-go-v2/service/ssm/types"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/LottieHQ/bifrost/internal/config"
-	"github.com/LottieHQ/bifrost/internal/discovery"
-	"github.com/LottieHQ/bifrost/internal/portcache"
-	"github.com/LottieHQ/bifrost/internal/sso"
-	"github.com/LottieHQ/bifrost/internal/ui"
 	ssosdk "github.com/aws/aws-sdk-go-v2/service/sso"
 	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/spf13/cobra"
 )
 
@@ -216,27 +216,30 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 		}
 		fmt.Printf("🌐 Port: %s\n", portFlag)
 
-		bastionInstanceIDFlag = resolveBastionID(awsCfg, bastionInstanceIDFlag, prompt)
-
+		// Resolve the target resource first so we know its VPC, then pick a bastion
+		// that lives in that VPC.
 		var endpoint string
 		var port int32
+		var resourceVPC string
 		if serviceTypeFlag == "redis" {
 			var clusterName string
 			clusterName, err = promptForRedis(awsCfg, prompt)
 			if err == nil {
-				endpoint, port, err = getRedisEndpoint(awsCfg, clusterName)
+				endpoint, port, resourceVPC, err = getRedisEndpoint(awsCfg, clusterName)
 			}
 		} else {
 			var dbName string
 			dbName, err = promptForRDS(awsCfg, prompt)
 			if err == nil {
-				endpoint, port, err = getRDSEndpoint(awsCfg, dbName)
+				endpoint, port, resourceVPC, err = getRDSEndpoint(awsCfg, dbName)
 			}
 		}
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
+
+		bastionInstanceIDFlag = resolveBastionID(awsCfg, bastionInstanceIDFlag, resourceVPC, prompt)
 
 		iamEnabled := serviceTypeFlag == "rds" && session.isKubernetesAccount()
 		runConnection(awsCfg, endpoint, port, portFlag, bastionInstanceIDFlag, regionFlag, iamEnabled, session.Username, prompt, keepAliveFlag, keepAliveInterval)
@@ -297,8 +300,8 @@ func runDiscoveredConnect(
 		fmt.Printf("⚠️  Could not persist port choice: %v\n", err)
 	}
 
-	// Validate bastion
-	bastionID := resolveBastionID(awsCfg, res.BastionID, prompt)
+	// Validate bastion — must be in the resource's VPC.
+	bastionID := resolveBastionID(awsCfg, res.BastionID, res.VpcID, prompt)
 
 	// Resolve username for IAM auth
 	username := getUsernameFromSTS(awsCfg)
@@ -331,16 +334,16 @@ func runProfileConnect(
 
 	serviceType := profile.ServiceType
 	portFlag := profile.Port
-	bastionID := resolveBastionID(awsCfg, profile.BastionInstanceID, prompt)
 
 	var endpoint string
 	var port int32
+	var resourceVPC string
 	if serviceType == "redis" && profile.RedisClusterName != "" {
 		fmt.Printf("🔗 Using Redis cluster: %s\n", profile.RedisClusterName)
-		endpoint, port, err = getRedisEndpoint(awsCfg, profile.RedisClusterName)
+		endpoint, port, resourceVPC, err = getRedisEndpoint(awsCfg, profile.RedisClusterName)
 	} else if profile.RDSInstanceName != "" {
 		fmt.Printf("🔗 Using RDS instance: %s\n", profile.RDSInstanceName)
-		endpoint, port, err = getRDSEndpoint(awsCfg, profile.RDSInstanceName)
+		endpoint, port, resourceVPC, err = getRDSEndpoint(awsCfg, profile.RDSInstanceName)
 	} else {
 		fmt.Println("Error: profile is missing resource name")
 		os.Exit(1)
@@ -349,6 +352,8 @@ func runProfileConnect(
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
+
+	bastionID := resolveBastionID(awsCfg, profile.BastionInstanceID, resourceVPC, prompt)
 
 	iamEnabled := serviceType == "rds" && session.isKubernetesAccount()
 	runConnection(awsCfg, endpoint, port, portFlag, bastionID, regionFlag, iamEnabled, session.Username, prompt, keepAlive, keepAliveInterval)
@@ -398,7 +403,7 @@ func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort str
 			} else {
 				fmt.Printf("\n🔑 IAM token for %s (expires in ~15 min):\n\n", iamAuthUser)
 				safeUser := strings.ReplaceAll(iamAuthUser, "'", "'\\''")
-			psqlCmd := fmt.Sprintf("PGPASSWORD='%s' psql -h localhost -p %s -U '%s' -d postgres", token, localPort, safeUser)
+				psqlCmd := fmt.Sprintf("PGPASSWORD='%s' psql -h localhost -p %s -U '%s' -d postgres", token, localPort, safeUser)
 				fmt.Printf("  %s\n\n", psqlCmd)
 				if err := clipboard.WriteAll(token); err == nil {
 					fmt.Println("📋 Token copied to clipboard — use as the password in your database client")
@@ -495,8 +500,8 @@ func startSSMTunnel(cfg aws.Config, instanceID, endpoint string, port int32, loc
 	// Marshal only the fields the plugin expects — the SDK structs include
 	// extra fields (ResultMetadata, Reason) that can confuse the plugin.
 	sessJSON, _ := json.Marshal(map[string]string{
-		"SessionId": aws.ToString(sess.SessionId),
-		"StreamUrl": aws.ToString(sess.StreamUrl),
+		"SessionId":  aws.ToString(sess.SessionId),
+		"StreamUrl":  aws.ToString(sess.StreamUrl),
 		"TokenValue": aws.ToString(sess.TokenValue),
 	})
 	inputJSON, _ := json.Marshal(map[string]any{
@@ -610,36 +615,91 @@ func promptForAuthMethod(username string, prompt *ui.Prompt) string {
 	return ""
 }
 
-// resolveBastionID validates a bastion ID or discovers one.
-func resolveBastionID(awsCfg aws.Config, bastionID string, prompt *ui.Prompt) string {
-	if bastionID != "" {
-		if isBastionConnected(awsCfg, bastionID) {
-			fmt.Printf("🏰 Using bastion: %s\n", bastionID)
-			return bastionID
-		}
-		fmt.Printf("⚠️  Bastion %s is not connected, discovering...\n", bastionID)
-	}
-
-	instances, instanceMap, err := listSSMManagedInstances(awsCfg)
+// resolveBastionID picks a bastion host that can actually reach the target
+// resource. targetVPC is the VPC the resource lives in (empty if unknown). When
+// the VPC is known, only same-VPC bastions are considered: an account can host
+// several VPCs (dev/staging/prod), and tunnelling through a bastion in another VPC
+// silently connects the user to the wrong network. If the VPC is known but no
+// online bastion exists in it, this aborts rather than risk a wrong connection.
+func resolveBastionID(awsCfg aws.Config, bastionID string, targetVPC string, prompt *ui.Prompt) string {
+	candidates, err := listSSMManagedInstances(awsCfg)
 	if err != nil {
 		fmt.Printf("Error listing SSM instances: %v\n", err)
 		os.Exit(1)
 	}
-	if len(instances) == 0 {
+
+	if len(candidates) == 0 {
 		fmt.Println("No SSM managed instances found.")
 		os.Exit(1)
 	}
-	if len(instances) == 1 {
-		id := instanceMap[instances[0]]
-		fmt.Printf("🏰 Auto-selected bastion: %s\n", instances[0])
-		return id
+
+	// vpcConfirmed is true only when we positively matched a bastion to the
+	// resource's VPC. When it's false we can't guarantee a same-network host, so we
+	// never auto-select silently — the user must consciously choose.
+	vpcConfirmed := false
+	if targetVPC != "" {
+		var matched, unknown []bastionChoice
+		for _, c := range candidates {
+			switch c.VpcID {
+			case targetVPC:
+				matched = append(matched, c)
+			case "":
+				unknown = append(unknown, c)
+			}
+		}
+		switch {
+		case len(matched) > 0:
+			candidates = matched
+			vpcConfirmed = true
+		case len(unknown) > 0:
+			// Couldn't confirm bastion VPCs (e.g. EC2 describe failed) — don't guess.
+			fmt.Println("⚠️  Could not confirm bastion VPCs; pick the one matching your target environment.")
+			candidates = unknown
+		default:
+			fmt.Printf("❌ No online bastion found in the resource's VPC (%s).\n", targetVPC)
+			fmt.Println("   Aborting to avoid tunnelling through a bastion in the wrong network.")
+			os.Exit(1)
+		}
+	} else {
+		// Resource VPC unknown (e.g. missing describe permission). We can't filter,
+		// so warn loudly and force a deliberate choice rather than risk the wrong VPC.
+		fmt.Println("⚠️  Could not determine the resource's VPC; cannot guarantee a same-network bastion.")
+		fmt.Println("   Pick the bastion matching your target environment.")
 	}
-	selected, err := prompt.Select("Select bastion instance", instances)
+
+	// Honour an explicitly-configured bastion only if it's a valid same-VPC candidate.
+	if bastionID != "" {
+		for _, c := range candidates {
+			if c.InstanceID == bastionID {
+				fmt.Printf("🏰 Using bastion: %s\n", bastionID)
+				return bastionID
+			}
+		}
+		if targetVPC != "" {
+			fmt.Printf("⚠️  Bastion %s is not in the resource's VPC; selecting a matching one...\n", bastionID)
+		} else {
+			fmt.Printf("⚠️  Bastion %s is not available, discovering...\n", bastionID)
+		}
+	}
+
+	// Only auto-select without prompting when the VPC was positively confirmed.
+	if len(candidates) == 1 && vpcConfirmed {
+		fmt.Printf("🏰 Auto-selected bastion: %s\n", candidates[0].DisplayName)
+		return candidates[0].InstanceID
+	}
+
+	displayNames := make([]string, len(candidates))
+	byDisplay := make(map[string]string, len(candidates))
+	for i, c := range candidates {
+		displayNames[i] = c.DisplayName
+		byDisplay[c.DisplayName] = c.InstanceID
+	}
+	selected, err := prompt.Select("Select bastion instance", displayNames)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
-	return instanceMap[selected]
+	return byDisplay[selected]
 }
 
 // promptForRDS prompts for an RDS instance name or lists available ones.
@@ -821,70 +881,52 @@ func getUsernameFromSTS(cfg aws.Config) string {
 	return ""
 }
 
-// isBastionConnected checks if a bastion instance is reachable via SSM
-func isBastionConnected(cfg aws.Config, instanceID string) bool {
-	ssmSvc := ssm.NewFromConfig(cfg)
-	result, err := ssmSvc.DescribeInstanceInformation(context.Background(), &ssm.DescribeInstanceInformationInput{
-		Filters: []types.InstanceInformationStringFilter{
-			{
-				Key:    aws.String("InstanceIds"),
-				Values: []string{instanceID},
-			},
-		},
-	})
-	if err != nil || len(result.InstanceInformationList) == 0 {
-		return false
-	}
-	return result.InstanceInformationList[0].PingStatus == types.PingStatusOnline
+// bastionChoice is a selectable bastion host annotated with its VPC.
+type bastionChoice struct {
+	DisplayName string // "Name (instance-id)" or just the instance id
+	InstanceID  string
+	VpcID       string // empty if EC2 details could not be fetched
 }
 
-// List all SSM managed instances that can be used as bastion hosts
-func listSSMManagedInstances(cfg aws.Config) ([]string, map[string]string, error) {
+// listSSMManagedInstances returns SSM-managed instances usable as bastion hosts,
+// each annotated with its VPC so callers can match a bastion to a target resource.
+func listSSMManagedInstances(cfg aws.Config) ([]bastionChoice, error) {
 	ssmSvc := ssm.NewFromConfig(cfg)
 	ec2Svc := ec2.NewFromConfig(cfg)
 
 	// Get all SSM managed instances
 	ssmResult, err := ssmSvc.DescribeInstanceInformation(context.Background(), &ssm.DescribeInstanceInformationInput{})
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to list SSM managed instances: %w", err)
-	}
-
-	if len(ssmResult.InstanceInformationList) == 0 {
-		return []string{}, map[string]string{}, nil
+		return nil, fmt.Errorf("failed to list SSM managed instances: %w", err)
 	}
 
 	// Get instance IDs that are online or connection lost (still manageable)
 	var instanceIds []string
 	for _, instance := range ssmResult.InstanceInformationList {
 		if instance.InstanceId != nil &&
-		   (instance.PingStatus == types.PingStatusOnline || instance.PingStatus == types.PingStatusConnectionLost) {
+			(instance.PingStatus == types.PingStatusOnline || instance.PingStatus == types.PingStatusConnectionLost) {
 			instanceIds = append(instanceIds, *instance.InstanceId)
 		}
 	}
 
 	if len(instanceIds) == 0 {
-		return []string{}, map[string]string{}, nil
+		return []bastionChoice{}, nil
 	}
 
-	// Get EC2 instance details to fetch Name tags
+	// Get EC2 instance details to fetch Name tags and VPCs.
 	ec2Result, err := ec2Svc.DescribeInstances(context.Background(), &ec2.DescribeInstancesInput{
 		InstanceIds: instanceIds,
 	})
 	if err != nil {
-		// If EC2 call fails, just return instance IDs without names
-		displayNames := make([]string, len(instanceIds))
-		instanceMap := make(map[string]string)
+		// If EC2 call fails, return instance IDs without names or VPCs.
+		choices := make([]bastionChoice, len(instanceIds))
 		for i, id := range instanceIds {
-			displayNames[i] = id
-			instanceMap[id] = id
+			choices[i] = bastionChoice{DisplayName: id, InstanceID: id}
 		}
-		return displayNames, instanceMap, nil
+		return choices, nil
 	}
 
-	// Build display names and mapping
-	displayNames := make([]string, 0, len(instanceIds))
-	instanceMap := make(map[string]string)
-
+	var choices []bastionChoice
 	for _, reservation := range ec2Result.Reservations {
 		for _, instance := range reservation.Instances {
 			if instance.InstanceId == nil {
@@ -902,20 +944,25 @@ func listSSMManagedInstances(cfg aws.Config) ([]string, map[string]string, error
 				}
 			}
 
-			// Create display name
-			var displayName string
+			displayName := instanceId
 			if name != "" {
 				displayName = fmt.Sprintf("%s (%s)", name, instanceId)
-			} else {
-				displayName = instanceId
 			}
 
-			displayNames = append(displayNames, displayName)
-			instanceMap[displayName] = instanceId
+			var vpcID string
+			if instance.VpcId != nil {
+				vpcID = *instance.VpcId
+			}
+
+			choices = append(choices, bastionChoice{
+				DisplayName: displayName,
+				InstanceID:  instanceId,
+				VpcID:       vpcID,
+			})
 		}
 	}
 
-	return displayNames, instanceMap, nil
+	return choices, nil
 }
 
 // List all RDS instances in the region
@@ -941,10 +988,10 @@ func listRDSInstances(cfg aws.Config) ([]string, error) {
 	return instances, nil
 }
 
-// Get the RDS database endpoint by DB instance name
-func getRDSEndpoint(cfg aws.Config, dbInstanceName string) (string, int32, error) {
+// Get the RDS database endpoint and VPC by DB instance name
+func getRDSEndpoint(cfg aws.Config, dbInstanceName string) (endpoint string, port int32, vpcID string, err error) {
 	if dbInstanceName == "" {
-		return "", 0, fmt.Errorf("RDS instance name cannot be empty")
+		return "", 0, "", fmt.Errorf("RDS instance name cannot be empty")
 	}
 	svc := rds.NewFromConfig(cfg)
 
@@ -953,20 +1000,24 @@ func getRDSEndpoint(cfg aws.Config, dbInstanceName string) (string, int32, error
 		DBInstanceIdentifier: &dbInstanceName,
 	})
 	if err != nil {
-		return "", 0, fmt.Errorf("failed to describe DB instance '%s': %w", dbInstanceName, err)
+		return "", 0, "", fmt.Errorf("failed to describe DB instance '%s': %w", dbInstanceName, err)
 	}
 
 	if len(result.DBInstances) == 0 {
-		return "", 0, fmt.Errorf("DB instance '%s' not found", dbInstanceName)
+		return "", 0, "", fmt.Errorf("DB instance '%s' not found", dbInstanceName)
 	}
 
 	db := result.DBInstances[0]
 	if db.Endpoint == nil {
-		return "", 0, fmt.Errorf("DB instance '%s' does not have an endpoint (may not be available)", dbInstanceName)
+		return "", 0, "", fmt.Errorf("DB instance '%s' does not have an endpoint (may not be available)", dbInstanceName)
+	}
+
+	if db.DBSubnetGroup != nil && db.DBSubnetGroup.VpcId != nil {
+		vpcID = *db.DBSubnetGroup.VpcId
 	}
 
 	fmt.Printf("🎯 Connecting to RDS instance: %s\n", *db.DBInstanceIdentifier)
-	return *db.Endpoint.Address, int32(*db.Endpoint.Port), nil
+	return *db.Endpoint.Address, int32(*db.Endpoint.Port), vpcID, nil
 }
 
 // List all Redis clusters in the region
@@ -992,10 +1043,10 @@ func listRedisClusters(cfg aws.Config) ([]string, error) {
 	return clusters, nil
 }
 
-// Get the Redis cluster endpoint by replication group name
-func getRedisEndpoint(cfg aws.Config, clusterName string) (string, int32, error) {
+// Get the Redis cluster endpoint and VPC by replication group name
+func getRedisEndpoint(cfg aws.Config, clusterName string) (endpoint string, port int32, vpcID string, err error) {
 	if clusterName == "" {
-		return "", 0, fmt.Errorf("redis cluster name cannot be empty")
+		return "", 0, "", fmt.Errorf("redis cluster name cannot be empty")
 	}
 	svc := elasticache.NewFromConfig(cfg)
 
@@ -1004,26 +1055,52 @@ func getRedisEndpoint(cfg aws.Config, clusterName string) (string, int32, error)
 		ReplicationGroupId: &clusterName,
 	})
 	if err != nil {
-		return "", 0, fmt.Errorf("failed to describe Redis cluster '%s': %w", clusterName, err)
+		return "", 0, "", fmt.Errorf("failed to describe Redis cluster '%s': %w", clusterName, err)
 	}
 
 	if len(result.ReplicationGroups) == 0 {
-		return "", 0, fmt.Errorf("redis cluster '%s' not found", clusterName)
+		return "", 0, "", fmt.Errorf("redis cluster '%s' not found", clusterName)
 	}
 
 	cluster := result.ReplicationGroups[0]
 
 	// Ensure NodeGroups is non-empty and PrimaryEndpoint is not nil
 	if len(cluster.NodeGroups) == 0 {
-		return "", 0, fmt.Errorf("redis cluster '%s' has no node groups", clusterName)
+		return "", 0, "", fmt.Errorf("redis cluster '%s' has no node groups", clusterName)
 	}
 
 	if cluster.NodeGroups[0].PrimaryEndpoint == nil {
-		return "", 0, fmt.Errorf("redis cluster '%s' does not have a primary endpoint (may not be available)", clusterName)
+		return "", 0, "", fmt.Errorf("redis cluster '%s' does not have a primary endpoint (may not be available)", clusterName)
 	}
 
+	vpcID = getRedisVPC(cfg, svc, cluster.MemberClusters)
+
 	fmt.Printf("🎯 Connecting to Redis cluster: %s\n", *cluster.ReplicationGroupId)
-	return *cluster.NodeGroups[0].PrimaryEndpoint.Address, int32(*cluster.NodeGroups[0].PrimaryEndpoint.Port), nil
+	return *cluster.NodeGroups[0].PrimaryEndpoint.Address, int32(*cluster.NodeGroups[0].PrimaryEndpoint.Port), vpcID, nil
+}
+
+// getRedisVPC resolves the VPC of a replication group via a member cache cluster's
+// subnet group. Returns "" if it can't be determined (callers treat that as
+// "unknown" and fall back to prompting rather than erroring).
+func getRedisVPC(cfg aws.Config, svc *elasticache.Client, memberClusters []string) string {
+	if len(memberClusters) == 0 {
+		return ""
+	}
+	ctx := context.Background()
+	cc, err := svc.DescribeCacheClusters(ctx, &elasticache.DescribeCacheClustersInput{
+		CacheClusterId: &memberClusters[0],
+	})
+	if err != nil || len(cc.CacheClusters) == 0 || cc.CacheClusters[0].CacheSubnetGroupName == nil {
+		return ""
+	}
+	name := *cc.CacheClusters[0].CacheSubnetGroupName
+	sg, err := svc.DescribeCacheSubnetGroups(ctx, &elasticache.DescribeCacheSubnetGroupsInput{
+		CacheSubnetGroupName: &name,
+	})
+	if err != nil || len(sg.CacheSubnetGroups) == 0 || sg.CacheSubnetGroups[0].VpcId == nil {
+		return ""
+	}
+	return *sg.CacheSubnetGroups[0].VpcId
 }
 
 // Keep alive functionality
@@ -1085,4 +1162,3 @@ func isPortInUse(port int) bool {
 	}
 	return false
 }
-
