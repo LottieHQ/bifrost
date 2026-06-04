@@ -51,6 +51,7 @@ func SaveCache(ssoProfile string, resources []Resource) error {
 		return err
 	}
 	c := Cache{
+		Version:   CacheVersion,
 		CachedAt:  time.Now(),
 		Resources: resources,
 	}
@@ -61,9 +62,14 @@ func SaveCache(ssoProfile string, resources []Resource) error {
 	return os.WriteFile(p, data, 0600)
 }
 
-// IsCacheValid returns true if the cache is non-nil and within the TTL.
+// IsCacheValid returns true if the cache is non-nil, written by the current
+// schema version, and within the TTL. Older-version caches are treated as invalid
+// so they're re-discovered (e.g. to populate VPC-matched bastions).
 func IsCacheValid(c *Cache) bool {
 	if c == nil {
+		return false
+	}
+	if c.Version != CacheVersion {
 		return false
 	}
 	return time.Since(c.CachedAt) < CacheTTL

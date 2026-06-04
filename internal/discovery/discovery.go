@@ -9,13 +9,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/elasticache"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/aws/aws-sdk-go-v2/service/sso"
-	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
 	ssotypes "github.com/aws/aws-sdk-go-v2/service/sso/types"
+	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -83,7 +84,7 @@ func discoverAccount(
 	var (
 		rdsResources   []Resource
 		redisResources []Resource
-		bastionID      string
+		bastions       []bastionInfo
 	)
 
 	ig, ictx := errgroup.WithContext(ctx)
@@ -107,11 +108,11 @@ func discoverAccount(
 	})
 
 	ig.Go(func() error {
-		id, err := discoverBastion(ictx, cfg)
+		b, err := discoverBastions(ictx, cfg)
 		if err != nil {
 			return fmt.Errorf("bastion discovery failed for %s: %w", accountName, err)
 		}
-		bastionID = id
+		bastions = b
 		return nil
 	})
 
@@ -119,13 +120,36 @@ func discoverAccount(
 		return nil, err
 	}
 
-	// Attach bastion to all resources in this account
+	// Attach a bastion that lives in the same VPC as each resource. Accounts can
+	// host multiple VPCs (e.g. dev/staging/prod), so a single account-wide bastion
+	// would route connections through the wrong network. If no same-VPC bastion is
+	// found, leave BastionID empty; the connect flow resolves/validates it again
+	// against the resource's VPC and errors rather than using a wrong-VPC host.
 	var results []Resource
 	for _, r := range append(rdsResources, redisResources...) {
-		r.BastionID = bastionID
+		r.BastionID = matchBastion(bastions, r.VpcID)
 		results = append(results, r)
 	}
 	return results, nil
+}
+
+// bastionInfo is a candidate bastion host annotated with the VPC it sits in.
+type bastionInfo struct {
+	InstanceID string
+	VpcID      string
+}
+
+// matchBastion returns the first bastion in the given VPC, or "" if none match.
+func matchBastion(bastions []bastionInfo, vpcID string) string {
+	if vpcID == "" {
+		return ""
+	}
+	for _, b := range bastions {
+		if b.VpcID == vpcID {
+			return b.InstanceID
+		}
+	}
+	return ""
 }
 
 func selectRole(ctx context.Context, ssoRegion string, token *ssooidc.CreateTokenOutput, accountID string) (string, error) {
@@ -179,10 +203,18 @@ func discoverRDS(ctx context.Context, cfg aws.Config, accountID, accountName, ro
 		return nil, err
 	}
 
+	// Map DB subnet group name -> VPC so each cluster can be matched to a bastion.
+	subnetVPCs := rdsSubnetGroupVPCs(ctx, client)
+
 	var resources []Resource
 	for _, cluster := range out.DBClusters {
 		if cluster.DBClusterIdentifier == nil || cluster.Endpoint == nil {
 			continue
+		}
+
+		var vpcID string
+		if cluster.DBSubnetGroup != nil {
+			vpcID = subnetVPCs[*cluster.DBSubnetGroup]
 		}
 
 		// Check for bifrost:iam-auth tag
@@ -219,6 +251,7 @@ func discoverRDS(ctx context.Context, cfg aws.Config, accountID, accountName, ro
 			Engine:         engine,
 			Port:           port,
 			Endpoint:       *cluster.Endpoint,
+			VpcID:          vpcID,
 			IAMAuthEnabled: iamAuth,
 		})
 	}
@@ -231,6 +264,11 @@ func discoverRedis(ctx context.Context, cfg aws.Config, accountID, accountName, 
 	if err != nil {
 		return nil, err
 	}
+
+	// ElastiCache replication groups don't carry a VPC directly; resolve it via a
+	// member cache cluster's subnet group. Build both maps once for the account.
+	clusterSubnet := cacheClusterSubnetGroups(ctx, client) // cache cluster id -> subnet group name
+	subnetVPCs := cacheSubnetGroupVPCs(ctx, client)        // subnet group name -> VPC
 
 	var resources []Resource
 	for _, rg := range out.ReplicationGroups {
@@ -245,6 +283,11 @@ func discoverRedis(ctx context.Context, cfg aws.Config, accountID, accountName, 
 			port = *rg.NodeGroups[0].PrimaryEndpoint.Port
 		}
 
+		var vpcID string
+		if len(rg.MemberClusters) > 0 {
+			vpcID = subnetVPCs[clusterSubnet[rg.MemberClusters[0]]]
+		}
+
 		resources = append(resources, Resource{
 			AccountID:   accountID,
 			AccountName: accountName,
@@ -255,23 +298,101 @@ func discoverRedis(ctx context.Context, cfg aws.Config, accountID, accountName, 
 			Engine:      "redis",
 			Port:        port,
 			Endpoint:    endpoint,
+			VpcID:       vpcID,
 		})
 	}
 	return resources, nil
 }
 
-func discoverBastion(ctx context.Context, cfg aws.Config) (string, error) {
+// discoverBastions returns the online SSM-managed instances in the account, each
+// annotated with the VPC it sits in so resources can be matched to a same-VPC host.
+func discoverBastions(ctx context.Context, cfg aws.Config) ([]bastionInfo, error) {
 	ssmClient := ssm.NewFromConfig(cfg)
 	out, err := ssmClient.DescribeInstanceInformation(ctx, &ssm.DescribeInstanceInformationInput{})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	// Find first online instance
+	var ids []string
 	for _, inst := range out.InstanceInformationList {
 		if inst.PingStatus == ssmtypes.PingStatusOnline && inst.InstanceId != nil {
-			return *inst.InstanceId, nil
+			ids = append(ids, *inst.InstanceId)
 		}
 	}
-	return "", nil // no bastion found, not an error
+	if len(ids) == 0 {
+		return nil, nil // no bastion found, not an error
+	}
+
+	// Resolve each instance's VPC via EC2.
+	ec2Client := ec2.NewFromConfig(cfg)
+	desc, err := ec2Client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{InstanceIds: ids})
+	if err != nil {
+		// Without VPC data we can't safely match; return ids with empty VPCs so the
+		// connect flow falls back to prompting rather than auto-picking wrongly.
+		bastions := make([]bastionInfo, 0, len(ids))
+		for _, id := range ids {
+			bastions = append(bastions, bastionInfo{InstanceID: id})
+		}
+		return bastions, nil
+	}
+
+	var bastions []bastionInfo
+	for _, res := range desc.Reservations {
+		for _, inst := range res.Instances {
+			if inst.InstanceId == nil {
+				continue
+			}
+			var vpcID string
+			if inst.VpcId != nil {
+				vpcID = *inst.VpcId
+			}
+			bastions = append(bastions, bastionInfo{InstanceID: *inst.InstanceId, VpcID: vpcID})
+		}
+	}
+	return bastions, nil
+}
+
+// rdsSubnetGroupVPCs maps DB subnet group name -> VPC ID for the account/region.
+func rdsSubnetGroupVPCs(ctx context.Context, client *rds.Client) map[string]string {
+	m := map[string]string{}
+	out, err := client.DescribeDBSubnetGroups(ctx, &rds.DescribeDBSubnetGroupsInput{})
+	if err != nil {
+		return m
+	}
+	for _, sg := range out.DBSubnetGroups {
+		if sg.DBSubnetGroupName != nil && sg.VpcId != nil {
+			m[*sg.DBSubnetGroupName] = *sg.VpcId
+		}
+	}
+	return m
+}
+
+// cacheClusterSubnetGroups maps cache cluster id -> cache subnet group name.
+func cacheClusterSubnetGroups(ctx context.Context, client *elasticache.Client) map[string]string {
+	m := map[string]string{}
+	out, err := client.DescribeCacheClusters(ctx, &elasticache.DescribeCacheClustersInput{})
+	if err != nil {
+		return m
+	}
+	for _, cc := range out.CacheClusters {
+		if cc.CacheClusterId != nil && cc.CacheSubnetGroupName != nil {
+			m[*cc.CacheClusterId] = *cc.CacheSubnetGroupName
+		}
+	}
+	return m
+}
+
+// cacheSubnetGroupVPCs maps cache subnet group name -> VPC ID for the account/region.
+func cacheSubnetGroupVPCs(ctx context.Context, client *elasticache.Client) map[string]string {
+	m := map[string]string{}
+	out, err := client.DescribeCacheSubnetGroups(ctx, &elasticache.DescribeCacheSubnetGroupsInput{})
+	if err != nil {
+		return m
+	}
+	for _, sg := range out.CacheSubnetGroups {
+		if sg.CacheSubnetGroupName != nil && sg.VpcId != nil {
+			m[*sg.CacheSubnetGroupName] = *sg.VpcId
+		}
+	}
+	return m
 }
