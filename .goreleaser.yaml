@@ -40,6 +40,13 @@ archives:
 homebrew_casks:
   - name: "bifrost"
 
+    # Homebrew 7.0 validates every cask in a tap against Linux on `brew tap`.
+    # Without this the Linux `sha256` resolves to nil and the whole tap is
+    # rejected. GoReleaser only emits `on_macos` urls, so the cask is
+    # macOS-only in fact; this says so.
+    custom_block: |
+      depends_on :macos
+
     hooks:
       post:
         # Apple Tax workaround - remove quarantine flag
