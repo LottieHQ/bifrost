@@ -14,18 +14,30 @@ import (
 	"github.com/LottieHQ/bifrost/internal/portcache"
 )
 
-func exitIfAborted(err error) {
-	if errors.Is(err, huh.ErrUserAborted) {
-		os.Exit(130)
-	}
-}
-
 // Prompt handles user interactions
-type Prompt struct{}
+type Prompt struct {
+	onAbort func()
+}
 
 // NewPrompt creates a new prompt handler
 func NewPrompt() *Prompt {
 	return &Prompt{}
+}
+
+// OnAbort registers a function to run when the user aborts a prompt (Ctrl+C),
+// just before the process exits. Use it to release resources that would
+// otherwise outlive the process, such as a running SSM tunnel.
+func (p *Prompt) OnAbort(fn func()) {
+	p.onAbort = fn
+}
+
+func (p *Prompt) exitIfAborted(err error) {
+	if errors.Is(err, huh.ErrUserAborted) {
+		if p.onAbort != nil {
+			p.onAbort()
+		}
+		os.Exit(130)
+	}
 }
 
 // Select prompts the user to select from a list of items
@@ -41,7 +53,7 @@ func (p *Prompt) Select(label string, items []string) (string, error) {
 	)
 
 	if err := form.Run(); err != nil {
-		exitIfAborted(err)
+		p.exitIfAborted(err)
 		return "", fmt.Errorf("select failed: %w", err)
 	}
 	return selected, nil
@@ -71,7 +83,7 @@ func (p *Prompt) Input(label string, validate func(string) error, defaultValue .
 	)
 
 	if err := form.Run(); err != nil {
-		exitIfAborted(err)
+		p.exitIfAborted(err)
 		return "", fmt.Errorf("input failed: %w", err)
 	}
 	return result, nil
@@ -171,7 +183,7 @@ func (p *Prompt) SelectResource(resources []discovery.Resource, profiles []strin
 		)
 
 		if err := form.Run(); err != nil {
-			exitIfAborted(err)
+			p.exitIfAborted(err)
 			return nil, "", fmt.Errorf("select failed: %w", err)
 		}
 
@@ -217,7 +229,7 @@ func (p *Prompt) Confirm(label string, description ...string) (bool, error) {
 	form := huh.NewForm(huh.NewGroup(c))
 
 	if err := form.Run(); err != nil {
-		exitIfAborted(err)
+		p.exitIfAborted(err)
 		return false, fmt.Errorf("confirmation failed: %w", err)
 	}
 	return confirm, nil

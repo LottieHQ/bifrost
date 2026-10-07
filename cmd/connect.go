@@ -368,6 +368,14 @@ func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort str
 	defer tunnel.Cancel()
 	defer tunnel.terminate(awsCfg)
 
+	// Ctrl+C inside a prompt doesn't raise SIGINT (the terminal is in raw mode),
+	// and the prompt exits the process, skipping the defers above. Tear the
+	// tunnel down explicitly so the plugin and SSM session don't outlive us.
+	prompt.OnAbort(func() {
+		tunnel.stop()
+		tunnel.terminate(awsCfg)
+	})
+
 	// Wait for tunnel to be ready
 	fmt.Println("\n⏳ Waiting for tunnel...")
 	ready, err := waitForTunnelReady(tunnel.Ctx, localPort, tunnel.ErrChan)
@@ -429,18 +437,7 @@ func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort str
 			os.Exit(1)
 		}
 	case <-tunnel.SigChan:
-		fmt.Println("\n🛑 Shutting down connection...")
-		tunnel.Cancel()
-		if tunnel.Cmd.Process != nil {
-			_ = tunnel.Cmd.Process.Signal(syscall.SIGTERM)
-		}
-		select {
-		case <-tunnel.ErrChan:
-		case <-time.After(300 * time.Millisecond):
-			if tunnel.Cmd.Process != nil {
-				_ = tunnel.Cmd.Process.Kill()
-			}
-		}
+		tunnel.stop()
 	}
 }
 
@@ -453,6 +450,23 @@ type ssmTunnel struct {
 	Ctx       context.Context
 	Cancel    context.CancelFunc
 	SigChan   chan os.Signal
+}
+
+// stop shuts down the session-manager-plugin process, escalating to SIGKILL if
+// it doesn't exit promptly after SIGTERM.
+func (t *ssmTunnel) stop() {
+	fmt.Println("\n🛑 Shutting down connection...")
+	t.Cancel()
+	if t.Cmd.Process != nil {
+		_ = t.Cmd.Process.Signal(syscall.SIGTERM)
+	}
+	select {
+	case <-t.ErrChan:
+	case <-time.After(300 * time.Millisecond):
+		if t.Cmd.Process != nil {
+			_ = t.Cmd.Process.Kill()
+		}
+	}
 }
 
 // terminate cleanly shuts down the SSM session via the API.
