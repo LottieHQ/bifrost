@@ -461,7 +461,8 @@ func (t *ssmTunnel) stop() {
 		_ = t.Cmd.Process.Signal(syscall.SIGTERM)
 	}
 	select {
-	case <-t.ErrChan:
+	case err := <-t.ErrChan:
+		_ = err // the tunnel is being torn down; its exit error is expected
 	case <-time.After(300 * time.Millisecond):
 		if t.Cmd.Process != nil {
 			_ = t.Cmd.Process.Kill()
