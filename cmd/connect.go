@@ -663,7 +663,7 @@ func resolveBastionID(awsCfg aws.Config, bastionID string, targetVPC string, pro
 		}
 		switch {
 		case len(matched) > 0:
-			candidates = matched
+			candidates = preferTagged(matched)
 			vpcConfirmed = true
 		case len(unknown) > 0:
 			// Couldn't confirm bastion VPCs (e.g. EC2 describe failed) — don't guess.
@@ -690,7 +690,7 @@ func resolveBastionID(awsCfg aws.Config, bastionID string, targetVPC string, pro
 			}
 		}
 		if targetVPC != "" {
-			fmt.Printf("⚠️  Bastion %s is not in the resource's VPC; selecting a matching one...\n", bastionID)
+			fmt.Printf("⚠️  Bastion %s is not a bastion in the resource's VPC; selecting a matching one...\n", bastionID)
 		} else {
 			fmt.Printf("⚠️  Bastion %s is not available, discovering...\n", bastionID)
 		}
@@ -900,6 +900,22 @@ type bastionChoice struct {
 	DisplayName string // "Name (instance-id)" or just the instance id
 	InstanceID  string
 	VpcID       string // empty if EC2 details could not be fetched
+	Tagged      bool   // carries bifrost:bastion=true
+}
+
+// preferTagged returns the bifrost:bastion-tagged choices, or all of them when
+// none are tagged.
+func preferTagged(choices []bastionChoice) []bastionChoice {
+	var tagged []bastionChoice
+	for _, c := range choices {
+		if c.Tagged {
+			tagged = append(tagged, c)
+		}
+	}
+	if len(tagged) == 0 {
+		return choices
+	}
+	return tagged
 }
 
 // listSSMManagedInstances returns SSM-managed instances usable as bastion hosts,
@@ -972,6 +988,7 @@ func listSSMManagedInstances(cfg aws.Config) ([]bastionChoice, error) {
 				DisplayName: displayName,
 				InstanceID:  instanceId,
 				VpcID:       vpcID,
+				Tagged:      discovery.IsBastionTagged(instance.Tags),
 			})
 		}
 	}

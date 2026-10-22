@@ -83,7 +83,7 @@ bifrost profile list
 
 **Keep Alive**: Bifrost sends periodic TCP health checks (every 30 seconds by default) to prevent SSM session timeouts.
 
-**Bastion Selection**: If a single SSM-managed instance exists in the target account, it's auto-selected. If multiple exist, you're prompted to choose.
+**Bastion Selection**: Bifrost only considers SSM-managed instances in the target resource's VPC. If any of them are tagged `bifrost:bastion=true`, only the tagged ones are candidates, so other SSM-managed hosts in the VPC (such as the Datastream relays) are skipped. A single candidate is auto-selected; with several, you're prompted to choose.
 ## Updating
 ### Using Homebrew
 

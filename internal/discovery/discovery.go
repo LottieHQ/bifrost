@@ -10,6 +10,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/elasticache"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
@@ -137,19 +138,45 @@ func discoverAccount(
 type bastionInfo struct {
 	InstanceID string
 	VpcID      string
+	Tagged     bool // carries bifrost:bastion=true
 }
 
-// matchBastion returns the first bastion in the given VPC, or "" if none match.
+// BastionTag marks an EC2 instance as a bastion host. In a VPC where any
+// SSM-managed instance carries bifrost:bastion=true, only tagged instances are
+// candidates; elsewhere every SSM-managed instance is, so untagged accounts keep
+// working. Other SSM-managed hosts (e.g. the Datastream relays) share the
+// bastions' VPCs but cannot reach every database.
+const BastionTag = "bifrost:bastion"
+
+// IsBastionTagged reports whether tags include bifrost:bastion=true.
+func IsBastionTagged(tags []ec2types.Tag) bool {
+	for _, tag := range tags {
+		if tag.Key != nil && *tag.Key == BastionTag && tag.Value != nil && *tag.Value == "true" {
+			return true
+		}
+	}
+	return false
+}
+
+// matchBastion returns the first tagged bastion in the given VPC, else the first
+// bastion in it, or "" if none match.
 func matchBastion(bastions []bastionInfo, vpcID string) string {
 	if vpcID == "" {
 		return ""
 	}
+	first := ""
 	for _, b := range bastions {
-		if b.VpcID == vpcID {
+		if b.VpcID != vpcID {
+			continue
+		}
+		if b.Tagged {
 			return b.InstanceID
 		}
+		if first == "" {
+			first = b.InstanceID
+		}
 	}
-	return ""
+	return first
 }
 
 func selectRole(ctx context.Context, ssoRegion string, token *ssooidc.CreateTokenOutput, accountID string) (string, error) {
@@ -346,7 +373,7 @@ func discoverBastions(ctx context.Context, cfg aws.Config) ([]bastionInfo, error
 			if inst.VpcId != nil {
 				vpcID = *inst.VpcId
 			}
-			bastions = append(bastions, bastionInfo{InstanceID: *inst.InstanceId, VpcID: vpcID})
+			bastions = append(bastions, bastionInfo{InstanceID: *inst.InstanceId, VpcID: vpcID, Tagged: IsBastionTagged(inst.Tags)})
 		}
 	}
 	return bastions, nil

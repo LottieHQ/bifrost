@@ -32,5 +32,6 @@ const CacheTTL = 1 * time.Hour
 
 // CacheVersion is bumped whenever the cached Resource shape changes in a way that
 // makes older caches unsafe to reuse. v2 added per-resource VPC + VPC-matched
-// bastion selection; pre-v2 caches must be discarded so they re-discover.
-const CacheVersion = 2
+// bastion selection; pre-v2 caches must be discarded so they re-discover. v3
+// prefers bifrost:bastion-tagged hosts, so v2 caches may hold a non-bastion.
+const CacheVersion = 3
