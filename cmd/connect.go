@@ -242,7 +242,7 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 		bastionInstanceIDFlag = resolveBastionID(awsCfg, bastionInstanceIDFlag, resourceVPC, prompt)
 
 		iamEnabled := serviceTypeFlag == "rds" && session.isKubernetesAccount()
-		runConnection(awsCfg, endpoint, port, portFlag, bastionInstanceIDFlag, regionFlag, iamEnabled, session.Username, prompt, keepAliveFlag, keepAliveInterval)
+		runConnection(awsCfg, endpoint, port, portFlag, bastionInstanceIDFlag, regionFlag, iamEnabled, session.Username, session.AccountID, prompt, keepAliveFlag, keepAliveInterval)
 	},
 }
 
@@ -307,7 +307,7 @@ func runDiscoveredConnect(
 	username := getUsernameFromSTS(awsCfg)
 	iamEnabled := res.IAMAuthEnabled && res.ServiceType == "rds"
 
-	runConnection(awsCfg, res.Endpoint, res.Port, portFlag, bastionID, region, iamEnabled, username, prompt, keepAlive, keepAliveInterval)
+	runConnection(awsCfg, res.Endpoint, res.Port, portFlag, bastionID, region, iamEnabled, username, res.AccountID, prompt, keepAlive, keepAliveInterval)
 }
 
 // runProfileConnect handles connection using a saved profile.
@@ -356,13 +356,13 @@ func runProfileConnect(
 	bastionID := resolveBastionID(awsCfg, profile.BastionInstanceID, resourceVPC, prompt)
 
 	iamEnabled := serviceType == "rds" && session.isKubernetesAccount()
-	runConnection(awsCfg, endpoint, port, portFlag, bastionID, regionFlag, iamEnabled, session.Username, prompt, keepAlive, keepAliveInterval)
+	runConnection(awsCfg, endpoint, port, portFlag, bastionID, regionFlag, iamEnabled, session.Username, session.AccountID, prompt, keepAlive, keepAliveInterval)
 }
 
 // runConnection starts the SSM tunnel, waits for it to be ready, then optionally
 // prompts for IAM auth and generates a token. This order makes it clear to the
 // user that the tunnel is open before asking about authentication.
-func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort string, bastionID string, region string, iamAuthEnabled bool, username string, prompt *ui.Prompt, keepAlive bool, keepAliveInterval time.Duration) {
+func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort string, bastionID string, region string, iamAuthEnabled bool, username string, accountID string, prompt *ui.Prompt, keepAlive bool, keepAliveInterval time.Duration) {
 	// Start SSM tunnel in background
 	tunnel := startSSMTunnel(awsCfg, bastionID, endpoint, port, localPort, region)
 	defer tunnel.Cancel()
@@ -397,7 +397,7 @@ func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort str
 		fmt.Println("This database supports IAM authentication — you can optionally")
 		fmt.Println("generate a 15-minute short-lived token by selecting an option below.")
 		fmt.Println()
-		iamAuthUser := promptForAuthMethod(username, prompt)
+		iamAuthUser := promptForAuthMethod(username, accountID, prompt)
 		if iamAuthUser != "" {
 			token, err := auth.BuildAuthToken(
 				context.Background(),
@@ -600,8 +600,29 @@ func waitForTunnelReady(ctx context.Context, localPort string, errChan <-chan er
 	return false, nil
 }
 
+const legacySuperuserGroup = "infra-aws-database-admins"
+
+var superuserGroups = map[string]string{
+	"904233092296": "infra-aws-database-admins-stg",
+	"733573666215": "infra-aws-database-admins-prd",
+}
+
+func superuserWarning(accountID string) string {
+	consequence := "If you are not a member, a token will still be generated but the su- database " +
+		"user won't exist and authentication will fail."
+	group, ok := superuserGroups[accountID]
+	if !ok {
+		return fmt.Sprintf("⚠️  Superuser requires the %s Google group. %s\n\n"+
+			"https://groups.google.com/a/lottie.org/g/%s/members", legacySuperuserGroup, consequence, legacySuperuserGroup)
+	}
+	return fmt.Sprintf("⚠️  Superuser on this account requires the %s Google group "+
+		"(Ravenna request \"Database superuser access\"). Until the old route is retired, "+
+		"the %s group also works. %s\n\n"+
+		"https://groups.google.com/a/lottie.org/g/%s/members", group, legacySuperuserGroup, consequence, group)
+}
+
 // promptForAuthMethod asks the user to pick IAM / IAM Admin / Password.
-func promptForAuthMethod(username string, prompt *ui.Prompt) string {
+func promptForAuthMethod(username, accountID string, prompt *ui.Prompt) string {
 	authOptions := []string{
 		fmt.Sprintf("🔑 IAM (%s)", username),
 		fmt.Sprintf("🔑 IAM Superuser (su-%s)", username),
@@ -614,11 +635,7 @@ func promptForAuthMethod(username string, prompt *ui.Prompt) string {
 	}
 	switch {
 	case strings.HasPrefix(authMethod, "🔑 IAM Superuser"):
-		warning := "⚠️  Superuser requires the infra-aws-database-admins Google group. " +
-			"If you are not a member, a token will still be generated but the su- database " +
-			"user won't exist and authentication will fail.\n\n" +
-			"https://groups.google.com/a/lottie.org/g/infra-aws-database-admins/members"
-		confirmed, err := prompt.Confirm("Continue with superuser?", warning)
+		confirmed, err := prompt.Confirm("Continue with superuser?", superuserWarning(accountID))
 		if err != nil || !confirmed {
 			fmt.Println("Using standard IAM auth instead")
 			return username
