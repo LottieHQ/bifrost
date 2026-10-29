@@ -635,11 +635,8 @@ func promptForAuthMethod(username, accountID string, prompt *ui.Prompt) string {
 	}
 	switch {
 	case strings.HasPrefix(authMethod, "🔑 IAM Superuser"):
-		confirmed, err := prompt.Confirm("Continue with superuser?", superuserWarning(accountID))
-		if err != nil || !confirmed {
-			fmt.Println("Using standard IAM auth instead")
-			return username
-		}
+		fmt.Println(superuserWarning(accountID))
+		fmt.Println()
 		return "su-" + username
 	case strings.HasPrefix(authMethod, "🔑 IAM ("):
 		return username
