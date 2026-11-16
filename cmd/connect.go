@@ -409,7 +409,7 @@ func runConnection(awsCfg aws.Config, endpoint string, port int32, localPort str
 			if err != nil {
 				fmt.Printf("❌ Failed to generate IAM auth token: %v\n", err)
 			} else {
-				fmt.Printf("\n🔑 IAM token for %s (expires in ~15 min):\n\n", iamAuthUser)
+				fmt.Printf("\n🔑 IAM token for %s (expires in ~15 min, around %s):\n\n", iamAuthUser, time.Now().Add(15*time.Minute).Format("15:04"))
 				safeUser := strings.ReplaceAll(iamAuthUser, "'", "'\\''")
 				psqlCmd := fmt.Sprintf("PGPASSWORD='%s' psql -h localhost -p %s -U '%s' -d postgres", token, localPort, safeUser)
 				fmt.Printf("  %s\n\n", psqlCmd)
