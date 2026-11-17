@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -24,7 +25,8 @@ import (
 const preferredRole = "DeveloperAccess"
 
 // Discover scans all accessible accounts in parallel and returns the combined
-// list of RDS and Redis resources, each annotated with a bastion instance.
+// list of RDS clusters, tagged RDS Proxy endpoints and Redis resources, each
+// annotated with a bastion instance.
 func Discover(
 	ctx context.Context,
 	ssoRegion string,
@@ -91,7 +93,7 @@ func discoverAccount(
 	ig, ictx := errgroup.WithContext(ctx)
 
 	ig.Go(func() error {
-		r, err := discoverRDS(ictx, cfg, accountID, accountName, roleName, region)
+		r, err := discoverRDS(ictx, rds.NewFromConfig(cfg), accountID, accountName, roleName, region)
 		if err != nil {
 			return fmt.Errorf("RDS discovery failed for %s: %w", accountName, err)
 		}
@@ -223,8 +225,38 @@ func BuildAWSConfig(ctx context.Context, ssoRegion string, token *ssooidc.Create
 	)
 }
 
-func discoverRDS(ctx context.Context, cfg aws.Config, accountID, accountName, roleName, region string) ([]Resource, error) {
-	client := rds.NewFromConfig(cfg)
+// rdsAPI is the subset of the RDS client discovery uses, so tests can fake it.
+type rdsAPI interface {
+	DescribeDBClusters(ctx context.Context, in *rds.DescribeDBClustersInput, optFns ...func(*rds.Options)) (*rds.DescribeDBClustersOutput, error)
+	DescribeDBSubnetGroups(ctx context.Context, in *rds.DescribeDBSubnetGroupsInput, optFns ...func(*rds.Options)) (*rds.DescribeDBSubnetGroupsOutput, error)
+	DescribeDBProxies(ctx context.Context, in *rds.DescribeDBProxiesInput, optFns ...func(*rds.Options)) (*rds.DescribeDBProxiesOutput, error)
+	DescribeDBProxyEndpoints(ctx context.Context, in *rds.DescribeDBProxyEndpointsInput, optFns ...func(*rds.Options)) (*rds.DescribeDBProxyEndpointsOutput, error)
+	ListTagsForResource(ctx context.Context, in *rds.ListTagsForResourceInput, optFns ...func(*rds.Options)) (*rds.ListTagsForResourceOutput, error)
+}
+
+// TailnetNameTag names the tailnet host a database is served on, e.g.
+// bifrost:tailnet-name=stg-example-pg. Infra sets it; `bifrost tailscale` reads it.
+const TailnetNameTag = "bifrost:tailnet-name"
+
+// rdsTags returns the resource's tags as a map, or an empty map if they cannot be read.
+func rdsTags(ctx context.Context, client rdsAPI, arn *string) map[string]string {
+	m := map[string]string{}
+	if arn == nil {
+		return m
+	}
+	out, err := client.ListTagsForResource(ctx, &rds.ListTagsForResourceInput{ResourceName: arn})
+	if err != nil {
+		return m
+	}
+	for _, tag := range out.TagList {
+		if tag.Key != nil && tag.Value != nil {
+			m[*tag.Key] = *tag.Value
+		}
+	}
+	return m
+}
+
+func discoverRDS(ctx context.Context, client rdsAPI, accountID, accountName, roleName, region string) ([]Resource, error) {
 	out, err := client.DescribeDBClusters(ctx, &rds.DescribeDBClustersInput{})
 	if err != nil {
 		return nil, err
@@ -244,19 +276,7 @@ func discoverRDS(ctx context.Context, cfg aws.Config, accountID, accountName, ro
 			vpcID = subnetVPCs[*cluster.DBSubnetGroup]
 		}
 
-		// Check for bifrost:iam-auth tag
-		iamAuth := false
-		tags, err := client.ListTagsForResource(ctx, &rds.ListTagsForResourceInput{
-			ResourceName: cluster.DBClusterArn,
-		})
-		if err == nil {
-			for _, tag := range tags.TagList {
-				if *tag.Key == "bifrost:iam-auth" && *tag.Value == "true" {
-					iamAuth = true
-					break
-				}
-			}
-		}
+		tags := rdsTags(ctx, client, cluster.DBClusterArn)
 
 		engine := "unknown"
 		if cluster.Engine != nil {
@@ -279,10 +299,70 @@ func discoverRDS(ctx context.Context, cfg aws.Config, accountID, accountName, ro
 			Port:           port,
 			Endpoint:       *cluster.Endpoint,
 			VpcID:          vpcID,
-			IAMAuthEnabled: iamAuth,
+			IAMAuthEnabled: tags["bifrost:iam-auth"] == "true",
+			TailnetName:    tags[TailnetNameTag],
 		})
 	}
+
+	resources = append(resources, discoverTailnetProxyEndpoints(ctx, client, accountID, accountName, roleName, region)...)
 	return resources, nil
+}
+
+// discoverTailnetProxyEndpoints returns the RDS Proxy endpoints that carry
+// bifrost:tailnet-name. Untagged endpoints are left out: `bifrost connect` does
+// not tunnel to proxies. Errors yield none rather than dropping the account's
+// clusters, since not every role may describe proxies.
+func discoverTailnetProxyEndpoints(ctx context.Context, client rdsAPI, accountID, accountName, roleName, region string) []Resource {
+	out, err := client.DescribeDBProxyEndpoints(ctx, &rds.DescribeDBProxyEndpointsInput{})
+	if err != nil || len(out.DBProxyEndpoints) == 0 {
+		return nil
+	}
+
+	// Endpoints don't carry an engine; their proxy's engine family does.
+	families := map[string]string{}
+	if proxies, err := client.DescribeDBProxies(ctx, &rds.DescribeDBProxiesInput{}); err == nil {
+		for _, p := range proxies.DBProxies {
+			if p.DBProxyName != nil && p.EngineFamily != nil {
+				families[*p.DBProxyName] = strings.ToLower(*p.EngineFamily)
+			}
+		}
+	}
+
+	var resources []Resource
+	for _, ep := range out.DBProxyEndpoints {
+		if ep.DBProxyEndpointName == nil || ep.Endpoint == nil {
+			continue
+		}
+		name := rdsTags(ctx, client, ep.DBProxyEndpointArn)[TailnetNameTag]
+		if name == "" {
+			continue
+		}
+
+		engine := "unknown"
+		if ep.DBProxyName != nil && families[*ep.DBProxyName] != "" {
+			engine = families[*ep.DBProxyName]
+		}
+		// Proxy endpoints listen on the engine family's default port.
+		var port int32 = 5432
+		if engine == "mysql" {
+			port = 3306
+		}
+
+		resources = append(resources, Resource{
+			AccountID:   accountID,
+			AccountName: accountName,
+			RoleName:    roleName,
+			Region:      region,
+			ServiceType: "rds-proxy",
+			Name:        *ep.DBProxyEndpointName,
+			Engine:      engine,
+			Port:        port,
+			Endpoint:    *ep.Endpoint,
+			VpcID:       aws.ToString(ep.VpcId),
+			TailnetName: name,
+		})
+	}
+	return resources
 }
 
 func discoverRedis(ctx context.Context, cfg aws.Config, accountID, accountName, roleName, region string) ([]Resource, error) {
@@ -380,7 +460,7 @@ func discoverBastions(ctx context.Context, cfg aws.Config) ([]bastionInfo, error
 }
 
 // rdsSubnetGroupVPCs maps DB subnet group name -> VPC ID for the account/region.
-func rdsSubnetGroupVPCs(ctx context.Context, client *rds.Client) map[string]string {
+func rdsSubnetGroupVPCs(ctx context.Context, client rdsAPI) map[string]string {
 	m := map[string]string{}
 	out, err := client.DescribeDBSubnetGroups(ctx, &rds.DescribeDBSubnetGroupsInput{})
 	if err != nil {

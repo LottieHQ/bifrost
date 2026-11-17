@@ -140,6 +140,9 @@ bifrost connect --service rds --port 3306 --bastion-instance-id i-1234567890abcd
 				}
 			}
 
+			// Tagged RDS Proxy endpoints are for `bifrost tailscale`; connect tunnels to clusters.
+			resources = withoutServiceType(resources, "rds-proxy")
+
 			if len(resources) > 0 {
 				// Get saved connection profile names
 				cfg, _ := cfgManager.Load()
@@ -1203,4 +1206,15 @@ func isPortInUse(port int) bool {
 		fmt.Fprintf(os.Stderr, "Warning: failed to close connection: %v\n", err)
 	}
 	return false
+}
+
+// withoutServiceType returns resources minus those of the given service type.
+func withoutServiceType(resources []discovery.Resource, serviceType string) []discovery.Resource {
+	var kept []discovery.Resource
+	for _, r := range resources {
+		if r.ServiceType != serviceType {
+			kept = append(kept, r)
+		}
+	}
+	return kept
 }
