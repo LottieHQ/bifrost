@@ -480,16 +480,17 @@ func connectTailnetPostgres(ctx context.Context, db discovery.Resource, host, ss
 	conninfo := postgresConninfo(host, db.Port, user)
 
 	if gui {
-		password := fmt.Sprintf("(copied; expires %s)", expires)
+		// The token goes only to the clipboard, never to the terminal or a log.
+		tokenNote := fmt.Sprintf("(copied; expires %s)", expires)
 		if err := clipboard.WriteAll(iamToken); err != nil {
-			password = fmt.Sprintf("%s (expires %s)", iamToken, expires)
+			tokenNote = "(clipboard unavailable; run again with --print)"
 		}
 		printGUIFields([][2]string{
 			{"Host", host},
 			{"Port", fmt.Sprintf("%d", db.Port)},
 			{"User", user},
 			{"Database", "postgres"},
-			{"Password", password},
+			{"Password", tokenNote},
 			{"SSL", "require"},
 		})
 		return
