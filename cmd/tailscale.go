@@ -159,7 +159,8 @@ bifrost tailscale --env stg --list`,
 		host := tailnetHost(db, suffix)
 		switch engineKind(db.Engine) {
 		case "postgres":
-			connectTailnetPostgres(ctx, db, host, ssoRegion, token, suFlag, printFlag, guiFlag)
+			// --su skips the question; without a terminal, the default is your own IAM user.
+			connectTailnetPostgres(ctx, db, host, ssoRegion, token, suFlag, !suFlag && stdinIsTerminal(), printFlag, guiFlag)
 		case "mysql":
 			if suFlag {
 				fail("--su applies to Postgres databases only")
@@ -178,7 +179,7 @@ func init() {
 	tailscaleCmd.Flags().Bool("print", false, "Print the client command instead of running it")
 	tailscaleCmd.Flags().Bool("gui", false, "Print connection fields for a GUI client and copy the Postgres token to the clipboard")
 	tailscaleCmd.Flags().Bool("list", false, "List the databases reachable now, one per line")
-	tailscaleCmd.Flags().Bool("su", false, "Postgres: connect as su-<user>")
+	tailscaleCmd.Flags().Bool("su", false, "Postgres: connect as su-<user> without asking")
 	tailscaleCmd.Flags().String("sso-profile", "", "SSO profile to use for authentication")
 	tailscaleCmd.Flags().Bool("refresh", false, "Force re-discovery of databases (ignore cache)")
 }
@@ -453,7 +454,23 @@ func postgresCommand(conninfo, token string) (clientCommand, error) {
 	}, nil
 }
 
-func connectTailnetPostgres(ctx context.Context, db discovery.Resource, host, ssoRegion string, token *ssooidc.CreateTokenOutput, su, printOnly, gui bool) {
+// promptTailnetSuperuser asks which IAM user to log in as, as `bifrost connect` does.
+func promptTailnetSuperuser(prompt *ui.Prompt, user string) bool {
+	superuser := fmt.Sprintf("🔑 IAM Superuser (su-%s)", user)
+	choice, err := prompt.Select("Log in as", []string{fmt.Sprintf("🔑 IAM (%s)", user), superuser})
+	if err != nil {
+		fail("Error selecting a user: %v", err)
+	}
+	return choice == superuser
+}
+
+// stdinIsTerminal reports whether a person can answer a prompt.
+func stdinIsTerminal() bool {
+	info, err := os.Stdin.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func connectTailnetPostgres(ctx context.Context, db discovery.Resource, host, ssoRegion string, token *ssooidc.CreateTokenOutput, su, askUser, printOnly, gui bool) {
 	awsCfg, err := discovery.BuildAWSConfig(ctx, ssoRegion, token, db.AccountID, db.RoleName, db.Region)
 	if err != nil {
 		fail("Error creating AWS config: %v", err)
@@ -461,6 +478,9 @@ func connectTailnetPostgres(ctx context.Context, db discovery.Resource, host, ss
 	user := getUsernameFromSTS(awsCfg)
 	if user == "" {
 		fail("could not read your user name from STS")
+	}
+	if askUser {
+		su = promptTailnetSuperuser(ui.NewPrompt(), user)
 	}
 	if su {
 		fmt.Fprintln(os.Stderr, superuserWarning(db.AccountID))
