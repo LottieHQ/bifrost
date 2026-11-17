@@ -2,6 +2,16 @@
 
 This file provides guidance to coding agents when working with code in this repository.
 
+## Pull requests
+
+This repository is LottieHQ's fork of `b3nk3/bifrost`. Never open a pull request, issue or comment against the upstream `b3nk3/bifrost`. `gh pr create` defaults to the upstream repository for a fork, so always pass `--repo LottieHQ/bifrost` and target `main` there:
+
+```bash
+gh pr create --repo LottieHQ/bifrost --base main
+```
+
+Never push to the `upstream` remote, and never push the upstream tags (v0.12.x) to `origin`: the tag workflow would bump the next release from them.
+
 ## Build and Development Commands
 
 ```bash
