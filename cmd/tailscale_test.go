@@ -101,6 +101,7 @@ func TestPostgresConninfoAndPrintLine(t *testing.T) {
 
 func TestPostgresCommandWithoutPsql(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
+	withHomebrewPrefixes(t, t.TempDir())
 	if _, err := postgresCommand("host=x", testToken); err == nil {
 		t.Error("want an error when psql is not on PATH, so the command is printed instead")
 	}
@@ -281,5 +282,30 @@ func TestWithoutServiceType(t *testing.T) {
 	}
 	if len(got) != len(testResources())-1 {
 		t.Errorf("got %d resources, want all but the proxy endpoint", len(got))
+	}
+}
+
+func withHomebrewPrefixes(t *testing.T, prefixes ...string) {
+	t.Helper()
+	saved := homebrewPrefixes
+	homebrewPrefixes = prefixes
+	t.Cleanup(func() { homebrewPrefixes = saved })
+}
+
+func TestFindClientUsesHomebrewKeg(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	prefix := t.TempDir()
+	bin := filepath.Join(prefix, "libpq", "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	psql := filepath.Join(bin, "psql")
+	if err := os.WriteFile(psql, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	withHomebrewPrefixes(t, prefix)
+	got, err := findClient("psql", "libpq")
+	if err != nil || got != psql {
+		t.Errorf("findClient = %q, %v; want %q", got, err, psql)
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -418,10 +419,30 @@ func postgresPrintLine(conninfo, token string) string {
 	return fmt.Sprintf("PGPASSWORD='%s' psql \"%s\"", token, conninfo)
 }
 
+// homebrewPrefixes are where Homebrew keeps keg-only formulae (Apple silicon, then
+// Intel). libpq and mysql-client are keg-only, so `brew install` does not put
+// psql or mysql on PATH. A variable so tests can point it elsewhere.
+var homebrewPrefixes = []string{"/opt/homebrew/opt", "/usr/local/opt"}
+
+// findClient looks for a client on PATH, then in its Homebrew keg.
+func findClient(name, keg string) (string, error) {
+	path, err := exec.LookPath(name)
+	if err == nil {
+		return path, nil
+	}
+	for _, prefix := range homebrewPrefixes {
+		candidate := filepath.Join(prefix, keg, "bin", name)
+		if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", err
+}
+
 // postgresCommand runs psql with the IAM token in the child's environment only,
 // never in argv, where other local users could read it from the process list.
 func postgresCommand(conninfo, token string) (clientCommand, error) {
-	path, err := exec.LookPath("psql")
+	path, err := findClient("psql", "libpq")
 	if err != nil {
 		return clientCommand{}, err
 	}
@@ -499,7 +520,7 @@ var errMariaDBClient = errors.New("mariadb client")
 // mysqlCommand runs the MySQL client. MYSQL_PWD is dropped so a stray value
 // cannot log in silently. A MariaDB client is refused, since it may reject --ssl-mode.
 func mysqlCommand(host string, port int32) (clientCommand, error) {
-	path, err := exec.LookPath("mysql")
+	path, err := findClient("mysql", "mysql-client")
 	if err != nil {
 		return clientCommand{}, err
 	}
